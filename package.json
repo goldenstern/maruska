@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@opencode/plugin": "^2.0.20"
+  },
+  "devDependencies": {
+    "asar": "^3.2.0"
+  }
+}

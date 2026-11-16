@@ -1,0 +1,11 @@
+{
+  "name": "lavk-dev-console",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "exports": "./index.ts",
+  "description": "LAVK DEV CONSOLE runtime plugin — persistent task ledger for OpenCode",
+  "dependencies": {
+    "@opencode/plugin": "^2.0.22"
+  }
+}
