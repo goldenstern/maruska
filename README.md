@@ -23,18 +23,47 @@ cd maruska
 npm install
 ```
 
-Плагин подключается в конфиге OpenCode проекта/машины (`opencode.json`):
+### 1. Зарегистрировать плагин (обязательный шаг!)
+
+OpenCode грузит плагины из каталога `~/.config/opencode/plugins/`. Сделайте джанкен/симлинк на `DEV_CONSOLE` из клона:
+
+**Windows (PowerShell, без админа):**
+
+```powershell
+New-Item -ItemType Junction `
+  -Path "$env:USERPROFILE\.config\opencode\plugins\dev-console" `
+  -Target "<путь-к-клону>\maruska\DEV_CONSOLE"
+```
+
+**macOS / Linux:**
+
+```bash
+mkdir -p ~/.config/opencode/plugins
+ln -s <путь-к-клону>/maruska/DEV_CONSOLE ~/.config/opencode/plugins/dev-console
+```
+
+### 2. Подключить скилл
+
+В конфиге OpenCode (`~/.config/opencode/opencode.json` или проектном):
 
 ```json
 {
   "model": "<твоя модель>",
-  "skills": ["<путь>/maruska/LAVK DEVATA"]
+  "skills": ["<путь-к-клону>/maruska/LAVK DEVATA"]
 }
 ```
 
-- Рантайм читает адрес и пароль твоего OpenCode-сервера из `~/.local/state/opencode/service.json` (или legacy `~/.config/opencode/service.json`) — ничего вписывать не надо.
-- В каждом проекте консоль создаёт свою папку `DEVATA/` — леджер, панель, лента. Это и есть память репо.
-- Скилл **LAVK DEVATA** (`LAVK DEVATA/SKILL.md`) — правила работы: понять заказ, записать в реестр, работать, верифицировать, гейтить решения Папы.
+### 3. Перезапустить OpenCode
+
+Перезапуск — и в каждом гит-репо при первом сеансе появится папка `DEVATA/`:
+леджер (`state.json`), панель (`CONSOLE_UI.html`), лента (`AGENT_CHAT.md`).
+Это и есть память репо.
+
+- Рантайм сам читает адрес и пароль твоего OpenCode-сервера из
+  `~/.local/state/opencode/service.json` (или legacy `~/.config/opencode/service.json`)
+  — ничего вписывать не надо.
+- Скилл **LAVK DEVATA** — правила работы: понять заказ, записать в реестр,
+  работать, верифицировать, гейтить решения Папы.
 
 ## Правило разделения
 
