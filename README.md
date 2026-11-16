@@ -62,3 +62,5 @@ node --experimental-strip-types --test DEV_CONSOLE/state.test.ts
 ---
 
 *Свет можно выключить — CPU-мониторы живут.* ⏻
+
+**Лицензия:** [GoldenStern All.](LICENSE.md) — НЕО-ДЕСПОТИЧЕСКАЯ (NDPL-1.0): всё наше, но можно поюзать. За простое размножение придёт АНАЛЬНЫЙ БУР.
