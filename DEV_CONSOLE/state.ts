@@ -2,8 +2,9 @@
 // No OpenCode imports here: unit-testable with plain node.
 // Syntax kept erasable (no enums/namespaces) for --experimental-strip-types.
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, copyFileSync, openSync, closeSync, fsyncSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, copyFileSync, openSync, closeSync, fsyncSync, statSync, unlinkSync } from "node:fs"
 import { dirname, join } from "node:path"
+import { createHash, randomUUID } from "node:crypto"
 // T117-ядро: каталог ипостасей чистый (без импортов OpenCode) — идём в него
 // за распознаванием имён-хвостов (заказ Основателя 29.10).
 import { PERSONAS, resolvePersona } from "./personas.ts"
@@ -116,6 +117,43 @@ export interface Agent {
   // сообщений подряд → пометка orientation-hell. undefined = легаси-запись (не считаем).
   orientation?: "pending" | "ok" | "hell"
   empty_first?: number // сколько пустых первых сообщений насчитано (≤ ORIENTATION_N)
+  // T240 / Phase 3: bounded self-report; separate from eta_min (immutable plan).
+  progress?: AgentProgress | null
+  // Per-session cumulative snapshots from /api/session and usage events. Replace, never sum snapshots.
+  usage?: AgentUsage | null
+  // Last observed tool activity, not a transcript.
+  last_tool?: AgentLastTool | null
+  // Completed assistant messages observed for this child session (not tool calls/provider retries).
+  request_count?: number
+  request_ids?: string[] // bounded dedupe ring for durable message.updated replay
+}
+
+export interface AgentProgress {
+  step: string
+  done: string | null
+  next: string | null
+  eta_remaining_min: number | null
+  updated_at: string
+  source: "self-report"
+}
+
+export interface AgentUsage {
+  input_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  total_tokens: number
+  cost_usd: number
+  updated_at: string
+  source: "session-snapshot" | "usage-event"
+}
+
+export interface AgentLastTool {
+  name: string
+  target: string | null
+  call_id?: string | null
+  updated_at: string
 }
 
 // T41: metrics computed at settle time, stored in the agent record.
@@ -154,6 +192,14 @@ export interface Ledger {
   tabs: TabSession[] // top-сессии проекта (вкладки) — регистр атрибуции
   models?: ModelStat[] // T66: таблица моделей/кулдаун (политика инстансов)
   foreign_sessions?: ForeignSession[] // T62: чужие сессии (только для UI, не для вкладок)
+  // P0-C: explicit deletion markers prevent stale snapshots from resurrecting
+  // entities removed by a newer writer. IDs are never reused within a project.
+  tombstones?: {
+    tasks?: Record<string, string>
+    agents?: Record<string, string>
+    tabs?: Record<string, string>
+    foreign_sessions?: Record<string, string>
+  }
   // T128: накопитель переработки за сутки — durable (лежит в state.json,
   // переживает рестарт рантайма, как T92 injection_count в записях агентов).
   overruns?: OverrunLedger
@@ -259,6 +305,11 @@ export interface OpInput {
   session_ref?: string | null // задаётся рантаймом (вызывающая сессия), не моделью
   est_min?: number | null // явная оценка фазы в минутах (если модель передала — главнее автоматики); null = очистка
   phase?: string // явный тег фазы (например: "impl", "review", "test")
+  // T240: progress self-report — caller identity comes from context.sessionID, never from input.
+  step?: string
+  done?: string | number | null
+  next?: string | null
+  eta_remaining_min?: number | null
 }
 
 export type OpOutcome =
@@ -589,6 +640,12 @@ export interface ModelStat {
   cooldown_until: string | null
   // Per-class metrics (T84): class → { ok, fail, editsPerSecSum, runs }
   byClass?: Record<TaskClass, { ok: number; fail: number; editsPerSecSum: number; runs: number }>
+  // P0-B: reset markers let stale writers distinguish an intentional reset
+  // from an independent increment. Counter deltas are merged against the
+  // snapshot loaded by each writer (see loadedModelBaseline).
+  upstream_streak_reset_at?: string | null
+  upstream_streak_updated_at?: string | null
+  cooldown_updated_at?: string | null
 }
 
 // Канонизация таблицы из JSON: только модели политики, без дублей и мусора.
@@ -630,6 +687,15 @@ function normalizeModels(raw: unknown): ModelStat[] {
       upstream_fails: num(r.upstream_fails),
       upstream_streak: num(r.upstream_streak),
       cooldown_until: typeof r.cooldown_until === "string" && r.cooldown_until !== "" ? r.cooldown_until : null,
+      upstream_streak_reset_at: typeof r.upstream_streak_reset_at === "string" && r.upstream_streak_reset_at !== ""
+        ? r.upstream_streak_reset_at
+        : null,
+      upstream_streak_updated_at: typeof r.upstream_streak_updated_at === "string" && r.upstream_streak_updated_at !== ""
+        ? r.upstream_streak_updated_at
+        : null,
+      cooldown_updated_at: typeof r.cooldown_updated_at === "string" && r.cooldown_updated_at !== ""
+        ? r.cooldown_updated_at
+        : null,
       byClass,
     })
   }
@@ -744,6 +810,8 @@ export function recordModelResult(
   if (ok) {
     stat.ok += 1
     stat.upstream_streak = 0 // T166: модель ожила — эскалация upstream-кулдауна сбрасывается
+    stat.upstream_streak_reset_at = now()
+    stat.upstream_streak_updated_at = stat.upstream_streak_reset_at
   } else if (kind === "upstream" || kind === "unknown") stat.upstream_fails = (stat.upstream_fails ?? 0) + 1
   else stat.fail += 1
   return stat
@@ -767,6 +835,7 @@ export function setModelCooldown(
     list.push(stat)
   }
   stat.cooldown_until = new Date(at + ms).toISOString()
+  stat.cooldown_updated_at = new Date(at).toISOString()
   return stat.cooldown_until
 }
 
@@ -792,6 +861,7 @@ export function bumpUpstreamCooldown(
     list.push(stat)
   }
   stat.upstream_streak = (stat.upstream_streak ?? 0) + 1
+  stat.upstream_streak_updated_at = new Date(at).toISOString()
   const ms = baseMs * Math.min(stat.upstream_streak, 4)
   stat.cooldown_until = new Date(at + ms).toISOString()
   return stat.cooldown_until
@@ -808,6 +878,12 @@ export function resetModelCooldowns(ledger: Ledger): number {
       s.cooldown_until = null
       cleared += 1
     }
+    // The user's explicit reset starts a new upstream-failure streak too;
+    // otherwise the next provider hiccup inherits the old escalated delay.
+    s.upstream_streak = 0
+    s.upstream_streak_reset_at = now()
+    s.upstream_streak_updated_at = s.upstream_streak_reset_at
+    s.cooldown_updated_at = s.upstream_streak_reset_at
   }
   return cleared
 }
@@ -832,6 +908,7 @@ export function recordModelResultByClass(
   ok: boolean,
   editsPerSec: number,
   kind?: AgentErrorClass,
+  countGlobal = true,
 ): ModelStat | null {
   const key = shortModelKey(model)
   if (!(key in POOL_KEY_TO_MODEL)) return null
@@ -842,10 +919,14 @@ export function recordModelResultByClass(
     stat = { model: POOL_KEY_TO_MODEL[key], ok: 0, fail: 0, cooldown_until: null, upstream_fails: 0 }
     list.push(stat)
   }
-  // Глобальные счётчики (для T66 совместимости и фолбэка)
-  if (ok) stat.ok += 1
-  else if (kind === "upstream" || kind === "unknown") stat.upstream_fails = (stat.upstream_fails ?? 0) + 1
-  else stat.fail += 1
+  // Global totals can be recorded by recordModelResult at the lifecycle edge.
+  // Keep the default for legacy/direct callers, but let the runtime avoid a
+  // second global increment when it also records per-class performance.
+  if (countGlobal) {
+    if (ok) stat.ok += 1
+    else if (kind === "upstream" || kind === "unknown") stat.upstream_fails = (stat.upstream_fails ?? 0) + 1
+    else stat.fail += 1
+  }
   // Per-class метрики: fail только по вине модели (T150) — upstream/unknown
   // в byClass.fail не пишем, иначе карантин/обучаемый выбор снова отравятся.
   if (!stat.byClass) stat.byClass = {}
@@ -1482,6 +1563,7 @@ export function beginAgent(
     home?: string | null
     model?: string | null
     cross?: CrossDurations // T116: кросс-опыт имени инстанса (докрутка окна ETA)
+    idFile?: string // P0-A: durable cross-process ID reservation for this project
   },
 ): Agent {
   const text = JSON.stringify(opts.input ?? "")
@@ -1495,7 +1577,9 @@ export function beginAgent(
         : typeof input.type === "string"
           ? input.type
           : "agent"
-  const id = nextAgentId(ledger.agents)
+  const id = opts.idFile
+    ? reserveLedgerId(opts.idFile, "agent", ledger.agents)
+    : nextAgentId(ledger.agents)
   const started = now()
   // T48: план спавна — est_min задачи, если он есть (осмысленный план-ETA),
   // иначе learnEta по виду. bound ищем ДО сборки записи — та же связка
@@ -1705,6 +1789,117 @@ export function noteInjection(ledger: Ledger, ref: string | null | undefined): n
   if (!a) return 0
   a.injection_count = (a.injection_count ?? 0) + 1
   return a.injection_count
+}
+
+// T240: keep telemetry bounded and plain text; it is display data, never instructions.
+function cleanAgentText(value: string, max: number): string {
+  return value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, max)
+}
+
+function cleanAgentTarget(value: string, max: number): string {
+  return cleanAgentText(value, 512)
+    .replace(/([?&](?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|secret|authorization)=)[^&#\s]*/gi, "$1[redacted]")
+    .replace(/\bauthorization\b\s*[:=]\s*(?:Bearer\s+)?(?:"[^"]*"|'[^']*'|[^\s,;&]+)/gi, "Authorization=[redacted]")
+    .replace(/\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret)\b\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;&]+)/gi, "$1=[redacted]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [redacted]")
+    .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,})\b/gi, "[redacted]")
+    .slice(0, max)
+}
+
+export function noteAgentProgress(
+  ledger: Ledger,
+  ref: string | null | undefined,
+  input: { step?: unknown; done?: unknown; next?: unknown; eta_remaining_min?: unknown },
+  at: string = now(),
+): Agent | null {
+  const a = ref ? ledger.agents.find((x) => x.session_ref === ref && isLive(x)) : undefined
+  if (!a) return null
+  if (typeof input.step !== "string" || cleanAgentText(input.step, 180) === "") {
+    throw new Error("progress.step is required (1–180 characters)")
+  }
+  const done = input.done == null ? null : cleanAgentTarget(String(input.done), 32)
+  const next = typeof input.next === "string" ? cleanAgentTarget(input.next, 120) || null : null
+  let eta: number | null = null
+  if (input.eta_remaining_min !== undefined && input.eta_remaining_min !== null) {
+    if (typeof input.eta_remaining_min !== "number" || !Number.isFinite(input.eta_remaining_min) || input.eta_remaining_min < 0 || input.eta_remaining_min > 1440) {
+      throw new Error("progress.eta_remaining_min must be between 0 and 1440")
+    }
+    eta = Math.round(input.eta_remaining_min * 10) / 10
+  }
+  a.progress = { step: cleanAgentTarget(input.step, 180), done, next, eta_remaining_min: eta, updated_at: at, source: "self-report" }
+  return a
+}
+
+function normalizedAgentUsage(raw: unknown, at: string, source: AgentUsage["source"]): AgentUsage | null {
+  if (!raw || typeof raw !== "object") return null
+  const r = raw as Record<string, unknown>
+  const tk = r.tokens && typeof r.tokens === "object" ? r.tokens as Record<string, unknown> : r
+  const cache = tk.cache && typeof tk.cache === "object" ? tk.cache as Record<string, unknown> : {}
+  const n = (v: unknown): number => typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0
+  const input = n(tk.input ?? r.input_tokens)
+  const output = n(tk.output ?? r.output_tokens)
+  const reasoning = n(tk.reasoning ?? r.reasoning_tokens)
+  const cacheRead = n(cache.read ?? r.cache_read_tokens)
+  const cacheWrite = n(cache.write ?? r.cache_write_tokens)
+  const cost = n(r.cost ?? r.cost_usd)
+  if (![input, output, reasoning, cacheRead, cacheWrite, cost].some((v) => v > 0)) return null
+  const reportedTotal = n(tk.total ?? tk.total_tokens ?? r.total_tokens)
+  const total = reportedTotal > 0 ? reportedTotal : input + output + reasoning + cacheRead + cacheWrite
+  return { input_tokens: input, output_tokens: output, reasoning_tokens: reasoning, cache_read_tokens: cacheRead, cache_write_tokens: cacheWrite, total_tokens: total, cost_usd: cost, updated_at: at, source }
+}
+
+export function noteAgentUsage(
+  ledger: Ledger,
+  ref: string | null | undefined,
+  raw: unknown,
+  at: string = now(),
+  source: AgentUsage["source"] = "usage-event",
+): Agent | null {
+  const a = ref ? ledger.agents.find((x) => x.session_ref === ref && isLive(x)) : undefined
+  if (!a) return null
+  const usage = normalizedAgentUsage(raw, at, source)
+  if (!usage) return null
+  if (a.usage && Date.parse(a.usage.updated_at) > Date.parse(at)) return null
+  // Usage events and /api/session are cumulative snapshots: replace, never add.
+  a.usage = usage
+  return a
+}
+
+export function noteAgentRequest(
+  ledger: Ledger,
+  ref: string | null | undefined,
+  messageId: string | null | undefined,
+): Agent | null {
+  const a = ref ? ledger.agents.find((x) => x.session_ref === ref && isLive(x)) : undefined
+  if (!a || typeof messageId !== "string" || messageId.trim() === "") return null
+  const seen = Array.isArray(a.request_ids) ? a.request_ids : []
+  if (seen.includes(messageId)) return null
+  a.request_ids = [...seen, messageId].slice(-64)
+  a.request_count = (a.request_count ?? 0) + 1
+  return a
+}
+
+export function noteAgentTool(
+  ledger: Ledger,
+  ref: string | null | undefined,
+  name: unknown,
+  target: unknown,
+  at: string = now(),
+  callId?: string | null,
+): Agent | null {
+  const a = ref ? ledger.agents.find((x) => x.session_ref === ref && isLive(x)) : undefined
+  if (!a || typeof name !== "string" || cleanAgentText(name, 48) === "") return null
+  const safeName = cleanAgentText(name, 48)
+  const safeTarget = typeof target === "string" && cleanAgentTarget(target, 80) !== "" ? cleanAgentTarget(target, 80) : null
+  const safeCallId = callId ?? null
+  if (a.last_tool) {
+    const previousAt = Date.parse(a.last_tool.updated_at)
+    const incomingAt = Date.parse(at)
+    if (previousAt > incomingAt) return null
+    if (previousAt === incomingAt && a.last_tool.name === safeName && a.last_tool.target === safeTarget && (a.last_tool.call_id ?? null) === safeCallId) return null
+  }
+  a.last_tool = { name: safeName, target: safeTarget, call_id: safeCallId, updated_at: at }
+  return a
 }
 
 // T42: format compact efficiency signature from Agent.counters (written at settle, not recalculated on render).
@@ -2060,6 +2255,9 @@ export function rekeyAgent(ledger: Ledger, fromRef: string | null, toRef: string
   const dup = ledger.agents.find((a) => a !== agent && a.session_ref === toRef)
   if (dup) {
     if (dup.state === "completed" || dup.state === "failed") agent.state = dup.state
+    const tombstones = ledger.tombstones ?? (ledger.tombstones = {})
+    const deletedAgents = tombstones.agents ?? (tombstones.agents = {})
+    deletedAgents[dup.id] = now()
     ledger.agents.splice(ledger.agents.indexOf(dup), 1)
   }
   agent.session_ref = toRef
@@ -2125,6 +2323,32 @@ function sanitizeAgent(raw: unknown): Agent {
   if (typeof r.empty_first === "number" && Number.isFinite(r.empty_first) && r.empty_first >= 0) {
     out.empty_first = Math.min(ORIENTATION_N, Math.floor(r.empty_first))
   }
+  // T240: backward-compatible optional telemetry; malformed fields are discarded.
+  const rawProgress = r.progress && typeof r.progress === "object" ? r.progress as Record<string, unknown> : null
+  if (rawProgress && typeof rawProgress.step === "string" && rawProgress.step.trim() !== "") {
+    const eta = rawProgress.eta_remaining_min
+    out.progress = {
+      step: cleanAgentTarget(rawProgress.step, 180),
+      done: typeof rawProgress.done === "string" && rawProgress.done.trim() !== "" ? cleanAgentTarget(rawProgress.done, 32) : null,
+      next: typeof rawProgress.next === "string" && rawProgress.next.trim() !== "" ? cleanAgentTarget(rawProgress.next, 120) : null,
+      eta_remaining_min: typeof eta === "number" && Number.isFinite(eta) && eta >= 0 && eta <= 1440 ? Math.round(eta * 10) / 10 : null,
+      updated_at: typeof rawProgress.updated_at === "string" ? rawProgress.updated_at : updated,
+      source: "self-report",
+    }
+  }
+  const rawUsage = r.usage && typeof r.usage === "object" ? r.usage as Record<string, unknown> : null
+  if (rawUsage) {
+    const n = (v: unknown): number => typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0
+    const input = n(rawUsage.input_tokens), output = n(rawUsage.output_tokens), reasoning = n(rawUsage.reasoning_tokens)
+    const cacheRead = n(rawUsage.cache_read_tokens), cacheWrite = n(rawUsage.cache_write_tokens)
+    out.usage = { input_tokens: input, output_tokens: output, reasoning_tokens: reasoning, cache_read_tokens: cacheRead, cache_write_tokens: cacheWrite, total_tokens: n(rawUsage.total_tokens) || input + output + reasoning + cacheRead + cacheWrite, cost_usd: n(rawUsage.cost_usd), updated_at: typeof rawUsage.updated_at === "string" ? rawUsage.updated_at : updated, source: rawUsage.source === "usage-event" ? "usage-event" : "session-snapshot" }
+  }
+  const rawTool = r.last_tool && typeof r.last_tool === "object" ? r.last_tool as Record<string, unknown> : null
+  if (rawTool && typeof rawTool.name === "string" && rawTool.name.trim() !== "") {
+    out.last_tool = { name: cleanAgentText(rawTool.name, 48), target: typeof rawTool.target === "string" && rawTool.target.trim() !== "" ? cleanAgentTarget(rawTool.target, 80) : null, call_id: typeof rawTool.call_id === "string" ? rawTool.call_id : null, updated_at: typeof rawTool.updated_at === "string" ? rawTool.updated_at : updated }
+  }
+  if (typeof r.request_count === "number" && Number.isFinite(r.request_count) && r.request_count >= 0) out.request_count = Math.floor(r.request_count)
+  if (Array.isArray(r.request_ids)) out.request_ids = r.request_ids.filter((id): id is string => typeof id === "string" && id !== "").slice(-64)
   if (r.self_report === null || (typeof r.self_report === "string" && r.self_report !== "")) out.self_report = r.self_report
   return out
 }
@@ -2206,6 +2430,14 @@ export function attachTabChildren(ledger: Ledger, children: ChildFeedItem[]): nu
     byParent.set(ch.parent_id, arr)
   }
   let n = 0
+  for (const child of children) {
+    if (child.usage) {
+      const agent = ledger.agents.find((a) => a.session_ref === child.session_id && isLive(a))
+      if (agent && (!agent.usage || Date.parse(agent.usage.updated_at) <= Date.parse(child.usage.updated_at))) {
+        agent.usage = child.usage // API snapshot replaces previous total; never accumulate snapshots
+      }
+    }
+  }
   for (const tab of ledger.tabs) {
     const kids = byParent.get(tab.session_id)
     if (kids && kids.length > 0) {
@@ -2398,6 +2630,7 @@ export interface ChildFeedItem {
   title: string // тема субагента («Трассировка канваса сигнала», «T159 · …»)
   model: string | null
   updated: string | null // ISO из time.updated
+  usage?: AgentUsage | null // cumulative session snapshot; optional for old runtimes
 }
 
 // Дети сессий ПРОЕКТА (обратная сторона parseSessionFeed: только parentID есть).
@@ -2428,6 +2661,7 @@ export function parseChildFeed(raw: unknown, root: string): ChildFeedItem[] {
         typeof updated === "number" && updated > Date.parse("2020-01-01")
           ? new Date(updated).toISOString()
           : null,
+      usage: normalizedAgentUsage(r, typeof updated === "number" && updated > Date.parse("2020-01-01") ? new Date(updated).toISOString() : now(), "session-snapshot"),
     })
   }
   return out
@@ -2695,8 +2929,180 @@ function readChatLines(ledgerFile?: string): string[] {
 
 // ------------------------------------------------------------ persistence ---
 
+// The stamp is the exact file content observed at load/save time. updated_at is
+// human-readable metadata, not a CAS token: two writes may share one millisecond.
+const loadedStamp = new WeakMap<object, string | null>()
+const loadedModelBaseline = new WeakMap<object, ModelStat[]>()
+
+function cloneModelStats(rows: readonly ModelStat[] | undefined): ModelStat[] {
+  return (rows ?? []).map((row) => ({
+    ...row,
+    byClass: row.byClass ? Object.fromEntries(
+      Object.entries(row.byClass).map(([key, value]) => [key, { ...value }]),
+    ) as ModelStat["byClass"] : undefined,
+  }))
+}
+
+function contentStamp(source: string): string {
+  return createHash("sha256").update(source, "utf8").digest("hex")
+}
+
+const LEDGER_LOCK_TIMEOUT_MS = 10_000
+const LEDGER_LOCK_STALE_MS = 60_000
+const lockWaitCell = new Int32Array(new SharedArrayBuffer(4))
+
+function lockOwnerAlive(pid: unknown): boolean {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === "EPERM"
+  }
+}
+
+/** Cross-process advisory lock for one ledger file. Saves are synchronous and short. */
+function acquireLedgerLock(file: string): () => void {
+  const lockFile = `${file}.lock`
+  const token = randomUUID()
+  const began = Date.now()
+  while (true) {
+    let fd: number | null = null
+    try {
+      fd = openSync(lockFile, "wx")
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, token, acquired_at: new Date().toISOString() }), "utf8")
+      fsyncSync(fd)
+      const ownedFd = fd
+      return () => {
+        try { closeSync(ownedFd) } catch { /* already closed */ }
+        try {
+          const owner = JSON.parse(readFileSync(lockFile, "utf8")) as { token?: unknown }
+          if (owner.token === token) unlinkSync(lockFile)
+        } catch { /* another process already reclaimed or removed the lock */ }
+      }
+    } catch (error) {
+      if (fd !== null) {
+        try { closeSync(fd) } catch { /* ignore cleanup */ }
+        try { unlinkSync(lockFile) } catch { /* ignore cleanup */ }
+      }
+      if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error
+    }
+
+    // Reclaim only locks old enough to be abandoned and whose owner is not alive.
+    try {
+      const age = Date.now() - statSync(lockFile).mtimeMs
+      if (age > LEDGER_LOCK_STALE_MS) {
+        let pid: unknown = null
+        try { pid = (JSON.parse(readFileSync(lockFile, "utf8")) as { pid?: unknown }).pid } catch { /* malformed */ }
+        if (!lockOwnerAlive(pid)) {
+          try { unlinkSync(lockFile) } catch { /* raced with owner/reclaimer */ }
+          continue
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") continue
+    }
+
+    if (Date.now() - began >= LEDGER_LOCK_TIMEOUT_MS) {
+      throw new Error(`timed out waiting for ledger lock: ${lockFile}`)
+    }
+    Atomics.wait(lockWaitCell, 0, 0, 20)
+  }
+}
+
+/**
+ * Reserve a project-wide monotonic T### / A### ID. The tiny sequence sidecar
+ * has its own cross-process lock, so reservation is atomic even when callers
+ * operate on stale in-memory ledger snapshots. A failed later ledger save may
+ * leave a gap; IDs are identifiers, not a gapless accounting sequence.
+ */
+export function reserveLedgerId(
+  file: string,
+  kind: "task" | "agent",
+  observed: readonly { id: string }[] = [],
+): string {
+  mkdirSync(dirname(file), { recursive: true })
+  const sequenceFile = `${file}.ids.json`
+  const release = acquireLedgerLock(sequenceFile)
+  try {
+    let seq: { version: number; task: number; agent: number } = { version: 1, task: 0, agent: 0 }
+    if (existsSync(sequenceFile)) {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(readFileSync(sequenceFile, "utf8"))
+      } catch (error) {
+        // Fail closed. Resetting a corrupt allocator can reuse a reservation
+        // that has not reached state.json yet.
+        throw new Error(`ledger ID allocator is corrupt; refusing to reuse IDs: ${sequenceFile} (${String(error)})`)
+      }
+      const raw = (parsed ?? {}) as Record<string, unknown>
+      const validCounter = (value: unknown): value is number =>
+        typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+      if (raw.version !== 1 || !validCounter(raw.task) || !validCounter(raw.agent)) {
+        throw new Error(`ledger ID allocator has an invalid shape; refusing to reuse IDs: ${sequenceFile}`)
+      }
+      seq = { version: 1, task: raw.task, agent: raw.agent }
+    }
+
+    const prefix = kind === "task" ? "T" : "A"
+    let maxSeen = 0
+    const scan = (rows: unknown): void => {
+      if (!Array.isArray(rows)) return
+      for (const row of rows) {
+        const id = (row as { id?: unknown } | null)?.id
+        if (typeof id !== "string") continue
+        const match = new RegExp(`^${prefix}(\\d+)$`).exec(id)
+        if (match) maxSeen = Math.max(maxSeen, Number(match[1]))
+      }
+    }
+    scan(observed)
+
+    // On first use, seed from the durable ledger (and its rolling backup), not
+    // only the caller's possibly stale view. Match loadLedger recovery: if the
+    // primary is corrupt, a valid .bak remains authoritative for allocation.
+    const readLedgerRows = (candidate: string): boolean => {
+      if (!existsSync(candidate)) return false
+      try {
+        const disk = JSON.parse(readFileSync(candidate, "utf8")) as Record<string, unknown> | null
+        if (!disk || typeof disk !== "object" || !Array.isArray(disk.tasks) || !Array.isArray(disk.agents)) return false
+        scan(kind === "task" ? disk.tasks : disk.agents)
+        return true
+      } catch {
+        return false
+      }
+    }
+    const primaryExists = existsSync(file)
+    const primaryReadable = primaryExists ? readLedgerRows(file) : false
+    const backupReadable = readLedgerRows(`${file}.bak`)
+    if (primaryExists && !primaryReadable && !backupReadable) {
+      throw new Error(`cannot seed ID allocator: primary ledger is unreadable and no valid backup exists: ${file}`)
+    }
+
+    const next = Math.max(seq[kind], maxSeen) + 1
+    if (!Number.isSafeInteger(next)) throw new Error(`ledger ${prefix} ID space exhausted`)
+    seq[kind] = next
+    const tmp = `${sequenceFile}.${process.pid}.${randomUUID()}.tmp`
+    let exists = false
+    try {
+      writeFileSync(tmp, JSON.stringify(seq, null, 2) + "\n", "utf8")
+      exists = true
+      const fd = openSync(tmp, "r+")
+      try { fsyncSync(fd) } finally { closeSync(fd) }
+      renameSync(tmp, sequenceFile)
+      exists = false
+    } finally {
+      if (exists) {
+        try { unlinkSync(tmp) } catch { /* best-effort cleanup */ }
+      }
+    }
+    return `${prefix}${next}`
+  } finally {
+    release()
+  }
+}
+
 export function freshLedger(): Ledger {
-  return { version: 1, updated_at: now(), tasks: [], agents: [], tabs: [], models: [] }
+  return { version: 1, updated_at: now(), tasks: [], agents: [], tabs: [], models: [], tombstones: {} }
 }
 
 // Каноническая форма задачи. Лишние ключи старых версий (blocker, question,
@@ -2736,10 +3142,16 @@ function sanitizeTask(raw: unknown): Task {
 }
 
 export function loadLedger(file: string): Ledger {
-  if (!existsSync(file)) return freshLedger()
+  if (!existsSync(file)) {
+    const empty = freshLedger()
+    loadedStamp.set(empty as unknown as object, null)
+    loadedModelBaseline.set(empty as unknown as object, [])
+    return empty
+  }
+  let source = readFileSync(file, "utf8")
   let parsed: unknown
   try {
-    parsed = JSON.parse(readFileSync(file, "utf8"))
+    parsed = JSON.parse(source)
   } catch (e) {
     // Main file is corrupt — try rolling backup
     const bak = file + ".bak"
@@ -2766,7 +3178,10 @@ export function loadLedger(file: string): Ledger {
         const bakLed = JSON.parse(bakContent) as Partial<Ledger>
         if (bakLed && Array.isArray(bakLed.tasks) && Array.isArray(bakLed.agents)) {
           console.error(`[dev-console] LEDGER RECOVERED FROM BACKUP: state.json had unexpected shape, loaded from state.json.bak`)
-          return loadLedgerFromParsed(bakLed, file)
+          const recovered = loadLedgerFromParsed(bakLed, file)
+          loadedStamp.set(recovered as unknown as object, contentStamp(source))
+          loadedModelBaseline.set(recovered as unknown as object, cloneModelStats(recovered.models))
+          return recovered
         }
       } catch {
         // Backup also invalid
@@ -2774,12 +3189,17 @@ export function loadLedger(file: string): Ledger {
     }
     throw new Error("state.json has an unexpected shape and no valid backup — refusing to guess ledger state")
   }
-  return loadLedgerFromParsed(led, file)
+  const loaded = loadLedgerFromParsed(led, file)
+  loadedStamp.set(loaded as unknown as object, contentStamp(source))
+  loadedModelBaseline.set(loaded as unknown as object, cloneModelStats(loaded.models))
+  return loaded
 }
 
 function loadLedgerFromParsed(led: Partial<Ledger>, file: string): Ledger {
-  const tabs = Array.isArray(led.tabs) ? led.tabs.map(sanitizeTab).filter((t): t is TabSession => t !== null) : []
-  const agents = led.agents.map(sanitizeAgent)
+  const tombstones = sanitizeTombstones(led.tombstones)
+  const tabs = (Array.isArray(led.tabs) ? led.tabs.map(sanitizeTab).filter((t): t is TabSession => t !== null) : [])
+    .filter((tab) => !tombstones.tabs?.[tab.session_id])
+  const agents = led.agents.map(sanitizeAgent).filter((agent) => !tombstones.agents?.[agent.id])
   // Эмодзи-идентичность (T71): поле появилось позже записи — первая загрузка с
   // фичей и есть та самая первая регистрация для до-T71 записей (см. комментарий
   // к backfillEmoji). Уже назначенные не трогаем: значение живёт в записи.
@@ -2794,18 +3214,18 @@ function loadLedgerFromParsed(led: Partial<Ledger>, file: string): Ledger {
         led.foreign_sessions
           .filter((f) => {
             if (!f || typeof f.session_id !== "string" || typeof f.title !== "string" || typeof f.last_seen !== "number") return false
-            return now - f.last_seen <= FOREIGN_TTL_MS
+            return now - f.last_seen <= FOREIGN_TTL_MS && !tombstones.foreign_sessions?.[f.session_id]
           })
           .map((f) => ({ session_id: f.session_id, title: f.title, last_seen: f.last_seen })),
         tabs,
       )
     : []
-  // T164: помечаем, какой updated_at был у файла на момент загрузки —
-  // saveLedger сверит и сольёт, если кто-то записал после нас.
+  // T164: exact byte-stamp is attached to the returned ledger by loadLedger;
+  // saveLedger compares it under the per-file lock before merging stale holders.
   const out = {
     version: typeof led.version === "number" ? led.version : 1,
     updated_at: typeof led.updated_at === "string" ? led.updated_at : now,
-    tasks: led.tasks.map(sanitizeTask),
+    tasks: led.tasks.map(sanitizeTask).filter((task) => !tombstones.tasks?.[task.id]),
     agents,
     // регистр вкладок восстановим заново (context-hook), поэтому отсутствие или
     // битый массив — не повод отказываться грузить ledger
@@ -2813,13 +3233,13 @@ function loadLedgerFromParsed(led: Partial<Ledger>, file: string): Ledger {
     // T66: таблица моделей/кулдаун — отсутствие/мусор старых версий = пустая
     // таблица (политика начнёт учиться с чистого листа, деградации нет)
     models: normalizeModels(led.models),
+    tombstones,
     // T62: foreign sessions from other projects
     foreign_sessions: foreignSessions,
     // T128: суточный накопитель переработки — durable, но чужие сутки не несём
     // (устаревший счётчик читается нулём и зануляется первым же settle)
     overruns: sanitizeOverruns(led.overruns),
   }
-  if (typeof led.updated_at === "string") loadedStamp.set(out as unknown as object, led.updated_at)
   return out
 }
 
@@ -2840,10 +3260,25 @@ function sanitizeOverruns(raw: unknown): OverrunLedger | undefined {
   return { day: r.day, total_min: num(r.total_min), by_home: byHome }
 }
 
-// T164: маркер «каким updated_at был файл, когда этот леджер загрузили».
-// saveLedger сравнивает с текущим файлом: файл менялся → снимок держателя
-// устарел → слияние вместо затирания (гонка целофайловых сохранений).
-const loadedStamp = new WeakMap<object, string>()
+function sanitizeTombstones(raw: unknown): NonNullable<Ledger["tombstones"]> {
+  const source = raw && typeof raw === "object" && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : {}
+  const sanitizeMap = (value: unknown): Record<string, string> => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+    const out: Record<string, string> = {}
+    for (const [id, at] of Object.entries(value as Record<string, unknown>)) {
+      if (id && typeof at === "string" && at !== "") out[id] = at
+    }
+    return out
+  }
+  return {
+    tasks: sanitizeMap(source.tasks),
+    agents: sanitizeMap(source.agents),
+    tabs: sanitizeMap(source.tabs),
+    foreign_sessions: sanitizeMap(source.foreign_sessions),
+  }
+}
 
 function mergeById<T>(
   freshArr: readonly T[],
@@ -2868,11 +3303,15 @@ function mergeById<T>(
   return Array.from(out.values()) // порядок: свежий файл + хвост держателя
 }
 
-// T165-хвост: models больше не мержится «как есть» (кулдауны откатывались):
-// счётчики/стрики — монотонный max (легитимно только растут), кулдаун — более
-// поздний expiry (свежий карантин сильнее), byClass — per-class max.
-function mergeModels(freshArr: readonly ModelStat[], callerArr: readonly ModelStat[]): ModelStat[] {
+// T165/P0-B: model metrics merge as per-writer deltas from the last loaded
+// baseline; cooldown/reset markers arbitrate non-monotone state transitions.
+function mergeModels(
+  freshArr: readonly ModelStat[],
+  callerArr: readonly ModelStat[],
+  baselineArr?: readonly ModelStat[],
+): ModelStat[] {
   const out = new Map<string, ModelStat>()
+  const baseline = new Map((baselineArr ?? []).map((row) => [row.model, row]))
   for (const f of freshArr) out.set(f.model, { ...f, byClass: f.byClass ? { ...f.byClass } : undefined })
   for (const c of callerArr) {
     const f = out.get(c.model)
@@ -2880,33 +3319,92 @@ function mergeModels(freshArr: readonly ModelStat[], callerArr: readonly ModelSt
       out.set(c.model, { ...c, byClass: c.byClass ? { ...c.byClass } : undefined })
       continue
     }
-    const later = (a: string | null, b: string | null): string | null => {
-      if (!a) return b ?? null
-      if (!b) return a
-      return Date.parse(a) >= Date.parse(b) ? a : b
+    const b = baseline.get(c.model)
+    const later = (a: string | null | undefined, d: string | null | undefined): string | null => {
+      if (!a) return d ?? null
+      if (!d) return a
+      return Date.parse(a) >= Date.parse(d) ? a : d
     }
+    // A known empty baseline means both writers may have created this row
+    // independently. Treat missing baseline fields as zero and add both deltas.
+    // Without a baseline (legacy/manual callers), retain conservative max merge.
+    const hasBaseline = baselineArr !== undefined
+    const count = (fv: number, cv: number, bv: number | undefined): number =>
+      hasBaseline ? fv + Math.max(0, cv - (bv ?? 0)) : Math.max(fv, cv)
+
+    // T165/P0-B: model outcomes are increments, not monotone snapshots. Merge
+    // each writer's delta from its load baseline into the current persisted
+    // value; replaying the same snapshot therefore cannot double-count it.
     const merged: ModelStat = {
       model: c.model,
-      ok: Math.max(f.ok, c.ok),
-      fail: Math.max(f.fail, c.fail),
+      ok: count(f.ok, c.ok, b?.ok),
+      fail: count(f.fail, c.fail, b?.fail),
       cooldown_until: later(f.cooldown_until, c.cooldown_until),
-      upstream_fails: Math.max(f.upstream_fails ?? 0, c.upstream_fails ?? 0),
+      cooldown_updated_at: later(f.cooldown_updated_at, c.cooldown_updated_at),
+      upstream_fails: count(f.upstream_fails ?? 0, c.upstream_fails ?? 0, b?.upstream_fails ?? (hasBaseline ? 0 : undefined)),
       upstream_streak: Math.max(f.upstream_streak ?? 0, c.upstream_streak ?? 0),
+      upstream_streak_reset_at: later(f.upstream_streak_reset_at, c.upstream_streak_reset_at),
+      upstream_streak_updated_at: later(f.upstream_streak_updated_at, c.upstream_streak_updated_at),
     }
+
+    // A reset is a new epoch. Discard stale pre-reset increments, but retain
+    // increments whose event timestamp is demonstrably after the winning reset.
+    if (b) {
+      const baseReset = b.upstream_streak_reset_at ?? null
+      const callerReset = c.upstream_streak_reset_at ?? null
+      const freshReset = f.upstream_streak_reset_at ?? null
+      const callerResetChanged = callerReset !== baseReset && callerReset !== null
+      const freshResetChanged = freshReset !== baseReset && freshReset !== null
+      const resetWinner = callerResetChanged && (!freshResetChanged || Date.parse(callerReset) >= Date.parse(freshReset))
+        ? { resetAt: callerReset, row: c, other: f }
+        : freshResetChanged
+          ? { resetAt: freshReset, row: f, other: c }
+          : null
+      if (resetWinner) {
+        const otherReset = resetWinner.other.upstream_streak_reset_at ?? null
+        const otherUpdated = resetWinner.other.upstream_streak_updated_at ?? null
+        const baseStreak = b.upstream_streak ?? 0
+        const otherDelta = otherReset === resetWinner.resetAt || !otherUpdated || Date.parse(otherUpdated) <= Date.parse(resetWinner.resetAt)
+          ? 0
+          : Math.max(0, (resetWinner.other.upstream_streak ?? 0) - baseStreak)
+        merged.upstream_streak = (resetWinner.row.upstream_streak ?? 0) + otherDelta
+        merged.upstream_streak_reset_at = resetWinner.resetAt
+      } else {
+        merged.upstream_streak = count(f.upstream_streak ?? 0, c.upstream_streak ?? 0, b.upstream_streak ?? 0)
+      }
+
+      // An explicit cooldown clear must beat an old still-present expiry.
+      // Legacy rows without timestamps retain the previous later-expiry rule.
+      const baseCooldownUpdate = b.cooldown_updated_at ?? null
+      const callerCooldownUpdate = c.cooldown_updated_at ?? null
+      const freshCooldownUpdate = f.cooldown_updated_at ?? null
+      const callerCooldownChanged = callerCooldownUpdate !== baseCooldownUpdate && callerCooldownUpdate !== null
+      const freshCooldownChanged = freshCooldownUpdate !== baseCooldownUpdate && freshCooldownUpdate !== null
+      if (callerCooldownChanged && (!freshCooldownChanged || Date.parse(callerCooldownUpdate) >= Date.parse(freshCooldownUpdate))) {
+        merged.cooldown_until = c.cooldown_until
+        merged.cooldown_updated_at = callerCooldownUpdate
+      } else if (freshCooldownChanged) {
+        merged.cooldown_until = f.cooldown_until
+        merged.cooldown_updated_at = freshCooldownUpdate
+      }
+    }
+
     if (f.byClass || c.byClass) {
       const by: NonNullable<ModelStat["byClass"]> = {} as NonNullable<ModelStat["byClass"]>
       for (const cls of new Set([...Object.keys(f.byClass ?? {}), ...Object.keys(c.byClass ?? {})])) {
         const fc = f.byClass?.[cls as TaskClass]
         const cc = c.byClass?.[cls as TaskClass]
-        if (!fc) by[cls as TaskClass] = cc!
-        else if (!cc) by[cls as TaskClass] = fc
-        else
+        const bc = b?.byClass?.[cls as TaskClass]
+        if (!fc) by[cls as TaskClass] = { ...cc! }
+        else if (!cc) by[cls as TaskClass] = { ...fc }
+        else {
           by[cls as TaskClass] = {
-            ok: Math.max(fc.ok, cc.ok),
-            fail: Math.max(fc.fail, cc.fail),
-            editsPerSecSum: Math.max(fc.editsPerSecSum, cc.editsPerSecSum),
-            runs: Math.max(fc.runs, cc.runs),
+            ok: count(fc.ok, cc.ok, bc?.ok),
+            fail: count(fc.fail, cc.fail, bc?.fail),
+            editsPerSecSum: count(fc.editsPerSecSum, cc.editsPerSecSum, bc?.editsPerSecSum),
+            runs: count(fc.runs, cc.runs, bc?.runs),
           }
+        }
       }
       merged.byClass = by
     }
@@ -2915,23 +3413,51 @@ function mergeModels(freshArr: readonly ModelStat[], callerArr: readonly ModelSt
   return Array.from(out.values())
 }
 
+function mergeTombstoneMap(
+  fresh: Record<string, string> | undefined,
+  caller: Record<string, string> | undefined,
+): Record<string, string> {
+  const out: Record<string, string> = { ...(fresh ?? {}) }
+  for (const [id, at] of Object.entries(caller ?? {})) {
+    if (!out[id] || Date.parse(at) >= Date.parse(out[id])) out[id] = at
+  }
+  return out
+}
+
+function mergeTombstones(
+  fresh: Ledger["tombstones"],
+  caller: Ledger["tombstones"],
+): NonNullable<Ledger["tombstones"]> {
+  return {
+    tasks: mergeTombstoneMap(fresh?.tasks, caller?.tasks),
+    agents: mergeTombstoneMap(fresh?.agents, caller?.agents),
+    tabs: mergeTombstoneMap(fresh?.tabs, caller?.tabs),
+    foreign_sessions: mergeTombstoneMap(fresh?.foreign_sessions, caller?.foreign_sessions),
+  }
+}
+
 // T164: слияние устаревшего снимка держателя поверх свежего файла —
 // по сущностям (задачи/агенты/вкладки/чужие) last-write-wins ПО updated_at,
 // поэтому затереть более новую запись невозможно (потеря T162 15.11).
-export function mergeLedger(fresh: Ledger, caller: Ledger): Ledger {
+export function mergeLedger(fresh: Ledger, caller: Ledger, baselineModels?: readonly ModelStat[]): Ledger {
+  const tombstones = mergeTombstones(fresh.tombstones, caller.tombstones)
   return {
     version: caller.version,
     updated_at: caller.updated_at,
-    tasks: mergeById(fresh.tasks, caller.tasks, (t) => t.id, (t) => t.updated_at),
-    agents: mergeById(fresh.agents, caller.agents, (a) => a.id, (a) => a.updated_at),
-    tabs: mergeById(fresh.tabs, caller.tabs, (t) => t.session_id, (t) => t.last_seen),
-    models: mergeModels(fresh.models ?? [], caller.models ?? []),
+    tasks: mergeById(fresh.tasks, caller.tasks, (t) => t.id, (t) => t.updated_at)
+      .filter((row) => !tombstones.tasks?.[row.id]),
+    agents: mergeById(fresh.agents, caller.agents, (a) => a.id, (a) => a.updated_at)
+      .filter((row) => !tombstones.agents?.[row.id]),
+    tabs: mergeById(fresh.tabs, caller.tabs, (t) => t.session_id, (t) => t.last_seen)
+      .filter((row) => !tombstones.tabs?.[row.session_id]),
+    models: mergeModels(fresh.models ?? [], caller.models ?? [], baselineModels),
     foreign_sessions: mergeById(
       fresh.foreign_sessions ?? [],
       caller.foreign_sessions ?? [],
       (f) => f.session_id,
       (f) => f.last_seen,
-    ),
+    ).filter((row) => !tombstones.foreign_sessions?.[row.session_id]),
+    tombstones,
     overruns: (() => {
       const fo = fresh.overruns
       const co = caller.overruns
@@ -2951,41 +3477,69 @@ export function mergeLedger(fresh: Ledger, caller: Ledger): Ledger {
   }
 }
 
-function peekUpdatedAt(file: string): string | null {
+function isUsableLedgerSnapshot(source: string): boolean {
   try {
-    const led = JSON.parse(readFileSync(file, "utf8")) as Partial<Ledger>
-    return typeof led?.updated_at === "string" ? led.updated_at : null
+    const parsed = JSON.parse(source) as Partial<Ledger> | null
+    if (!parsed || !Array.isArray(parsed.tasks) || !Array.isArray(parsed.agents)) return false
+    // These are the strict fields that make loadLedger reject the primary file.
+    parsed.tasks.forEach(sanitizeTask)
+    parsed.agents.forEach(sanitizeAgent)
+    return true
   } catch {
-    return null
+    return false
   }
 }
 
 export function saveLedger(file: string, ledger: Ledger): void {
-  // T164 (потеря T162 15.11): держатель, грузивший леджер раньше, мог держать
-  // устаревший снимок (await-циклы seed/blink/feed). Файл менялся с его
-  // загрузки → пишем СЛИЯНИЕМ поверх свежего файла, а не затиранием.
-  const stamp = loadedStamp.get(ledger as unknown as object) ?? null
-  if (stamp !== null && existsSync(file)) {
-    const cur = peekUpdatedAt(file)
-    if (cur !== null && cur !== stamp) {
-      ledger = mergeLedger(loadLedger(file), ledger)
-    }
-  }
-  ledger.updated_at = now()
   mkdirSync(dirname(file), { recursive: true })
-  const tmp = file + ".tmp"
-  const bak = file + ".bak"
-  // Atomic write: temp file → fsync → rolling backup → atomic rename
-  writeFileSync(tmp, JSON.stringify(ledger, null, 2) + "\n", { encoding: "utf8" })
-  // fsync the temp file to ensure data hits the disk before rename
-  // Use "r+" on Windows to allow fsync; "r" is read-only and fails EPERM on Windows
-  const fd = openSync(tmp, "r+")
-  try { fsyncSync(fd) } finally { closeSync(fd) }
-  // Rolling backup: copy current valid state.json to .bak before replacing
-  if (existsSync(file)) {
-    try { copyFileSync(file, bak) } catch { /* backup failed — not fatal, proceed */ }
+  const releaseLock = acquireLedgerLock(file)
+  const target = ledger
+  const targetRef = target as unknown as object
+  const baseline = loadedStamp.get(targetRef)
+  const modelBaseline = loadedModelBaseline.get(targetRef)
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`
+  let tmpExists = false
+
+  try {
+    // T164: compare the exact bytes observed on load, not updated_at. This also
+    // detects a file created after loadLedger returned an empty fresh ledger.
+    const currentSource = existsSync(file) ? readFileSync(file, "utf8") : null
+    const currentStamp = currentSource === null ? null : contentStamp(currentSource)
+    if (currentStamp !== baseline) {
+      if (currentSource !== null) {
+        // Another writer changed the file: merge under the file lock, then copy
+        // the merged root back into the caller's object so its view stays current.
+        Object.assign(target, mergeLedger(loadLedger(file), target, modelBaseline))
+      } else if (baseline !== null && baseline !== undefined) {
+        // A previously existing ledger disappeared. Do not silently resurrect
+        // an old snapshot over an intentional reset or external deletion.
+        throw new Error(`ledger disappeared after load; refusing stale overwrite: ${file}`)
+      }
+    }
+
+    target.updated_at = now()
+    const serialized = JSON.stringify(target, null, 2) + "\n"
+    // Unique temp names allow independent processes to stage writes safely.
+    writeFileSync(tmp, serialized, { encoding: "utf8" })
+    tmpExists = true
+    // fsync the temp file before the atomic rename. Windows requires r+ here.
+    const fd = openSync(tmp, "r+")
+    try { fsyncSync(fd) } finally { closeSync(fd) }
+
+    // Rolling backup: preserve the last main file before replacing it.
+    if (currentSource !== null && isUsableLedgerSnapshot(currentSource)) {
+      try { copyFileSync(file, file + ".bak") } catch { /* backup failure is non-fatal */ }
+    }
+    renameSync(tmp, file)
+    tmpExists = false
+    loadedStamp.set(targetRef, contentStamp(serialized))
+    loadedModelBaseline.set(targetRef, cloneModelStats(target.models))
+  } finally {
+    if (tmpExists) {
+      try { unlinkSync(tmp) } catch { /* best-effort temp cleanup */ }
+    }
+    releaseLock()
   }
-  renameSync(tmp, file) // atomic replace
 }
 
 // ---------------------------------------------------------------- ops -------
@@ -3006,7 +3560,7 @@ function findTask(ledger: Ledger, id: unknown): Task | OpOutcome {
   return t
 }
 
-function opCreate(ledger: Ledger, input: OpInput): OpOutcome {
+function opCreate(ledger: Ledger, input: OpInput, idFile?: string): OpOutcome {
   if (!nonEmpty(input.task)) return fail("create requires a non-empty 'task' description")
   if (input.parent != null) {
     const found = findTask(ledger, input.parent)
@@ -3058,7 +3612,7 @@ function opCreate(ledger: Ledger, input: OpInput): OpOutcome {
   }
   
   const task: Task = {
-    id: nextTaskId(ledger.tasks),
+    id: idFile ? reserveLedgerId(idFile, "task", ledger.tasks) : nextTaskId(ledger.tasks),
     task: input.task.trim(),
     state: "WAIT",
     owner: input.owner ?? null,
@@ -3189,10 +3743,14 @@ function opSetState(ledger: Ledger, input: OpInput): OpOutcome {
   return { ok: true, ledger, task: t }
 }
 
-export function applyOp(ledger: Ledger, input: OpInput): OpOutcome {
+export function applyOp(
+  ledger: Ledger,
+  input: OpInput,
+  options: { idFile?: string } = {},
+): OpOutcome {
   switch (input.op) {
     case "create":
-      return opCreate(ledger, input)
+      return opCreate(ledger, input, options.idFile)
     case "update":
       return opUpdate(ledger, input)
     case "set_state":
@@ -4506,10 +5064,28 @@ function queueHeader(open: Task[], agents: Agent[], liveCount: number): string {
 // T42: компактная подпись эффективности из Agent.counters (план/факт, ⚠, injections)
 // добавляется после существующих токенов; записей без counters — просто без подписи.
 // T84: токен автовыбора модели по классу («авто: nemotron (6 набл.)» или «авто: T66-дефолт»).
+function formatAgentCount(value: number): string {
+  const n = Math.max(0, Math.floor(Number.isFinite(value) ? value : 0))
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}m`
+  if (n >= 10_000) return `${Math.round(n / 1_000) / 10}k`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
+  return String(n)
+}
+
 function describeDaemon(a: Agent, all: Task[], ledger?: Ledger): string {
   const bound = a.task_id ? all.find((t) => t.id === a.task_id) : null
   const p = bound ? progressOf(bound, all) : null
-  const tail = `${p ? `${bar(p)} · ` : ""}${remaining(a)}`
+  const planTail = remaining(a)
+  const liveProgress = a.progress
+  const progressAge = liveProgress ? Date.now() - Date.parse(liveProgress.updated_at) : Infinity
+  const progressBits = liveProgress
+    ? [`шаг: ${clip(liveProgress.step, 68)}`, liveProgress.done ? liveProgress.done : "", liveProgress.next ? `→ ${clip(liveProgress.next, 42)}` : "", liveProgress.eta_remaining_min !== null ? `ETA≈${liveProgress.eta_remaining_min}м` : "", "самоотчёт", progressAge > 5 * 60_000 ? "устарел" : ""].filter(Boolean)
+    : []
+  const progressTail = progressBits.length ? ` · ${progressBits.join(" · ")}` : ""
+  const toolTail = a.last_tool ? ` · tool: ${clip(a.last_tool.name, 28)}${a.last_tool.target ? ` → ${clip(a.last_tool.target, 54)}` : ""}` : ""
+  const usageTail = a.usage ? ` · TOK ${formatAgentCount(a.usage.total_tokens)} (in ${formatAgentCount(a.usage.input_tokens)}/out ${formatAgentCount(a.usage.output_tokens)})${a.usage.cost_usd > 0 ? ` · $${a.usage.cost_usd.toFixed(4)}` : ""}` : ""
+  const requestTail = typeof a.request_count === "number" ? ` · REQ ${formatAgentCount(a.request_count)}` : ""
+  const tail = `${p ? `${bar(p)} · ` : ""}${planTail}${progressTail}${toolTail}${usageTail}${requestTail}`
   // Коротко для Основателя: сжатый таск + модель; имя записи = имя демона.
   const what = bound ? clip(bound.task, AGENT_WHAT_CHARS) : a.note
   const head = [a.task_id ? `[${a.task_id}]` : "", a.model ?? "", what ?? ""].filter(Boolean).join(" · ")
@@ -4563,8 +5139,9 @@ function describeChild(ch: ChildFeedItem, at: number = Date.now()): string | nul
   const hhmm = new Date(upd).toTimeString().slice(0, 5)
   const what = clip(ch.title, AGENT_WHAT_CHARS)
   const model = ch.model ? ` · ${ch.model}` : ""
+  const usage = ch.usage ? ` · TOK ${formatAgentCount(ch.usage.total_tokens)}${ch.usage.cost_usd > 0 ? ` · $${ch.usage.cost_usd.toFixed(4)}` : ""}` : ""
   const status = age <= 60_000 ? `работает ⏱ · ${hhmm}` : `простаивает · ${hhmm}`
-  return `${DAEMON_INDENT}▸ ${what}${model} · ${status}`
+  return `${DAEMON_INDENT}▸ ${what}${model} · ${status}${usage}`
 }
 
 // T70 (заказ Основателя 07.10): строка ⛔ несёт инстанс, в котором она ждёт

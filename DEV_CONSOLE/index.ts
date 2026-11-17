@@ -18,6 +18,7 @@ import {
   type CrossExperience,
 } from "./experience.ts" // T116: EXPERIENCE_CORE — межрепо-опыт по именам инстансов
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
+import { ServerGuard, SERVER_REGISTRY_FILE, spawnDetached, type ServerRegistry } from "./server_guard.ts"
 import { basename, dirname, join } from "node:path"
 import {
   applyOp,
@@ -65,6 +66,10 @@ import {
   markAgentError,
   noSelfReportReason,
   noteInjection,
+  noteAgentProgress,
+  noteAgentTool,
+  noteAgentRequest,
+  noteAgentUsage,
   noteTabEffWork, // T118: работа = Δ numstat → durable накопители вкладки
   overrunWakeReason,
   OVERRUN_WAKE_FACTOR,
@@ -100,6 +105,7 @@ import {
   saveModelHealth,
   recordModelHealth,
   applyModelHealth,
+  reserveLedgerId,
   setModelCooldown,
   shortModelKey,
   syncTabTitle,
@@ -143,7 +149,6 @@ import {
 // ~/.config/opencode/agents/maruska.md. Спавн-инъекция — dispatchPrompt ниже.
 import { instancePersona, instancePromptBlock, personaForTaskClass, personaPromptBlock, topLevelPersona, type Persona } from "./personas.ts"
 // T94-очередь (заказ 11.11): детерминированная передача тест-сервера ожидающему
-import { serverQueueAdd, serverQueueTake, serverReservationActive, type ServerWaiter } from "./state.ts"
 // T125 (заказ 11.11): право на эмодзи/мигание — только прямой чат с Основателем
 import { isDirectConversation } from "./state.ts"
 // T94-серверы-тасков: чистые функции протокола запроса сервера (без ИИ-логики)
@@ -179,366 +184,6 @@ const serializeAgentSpawn = (<T>(fn: () => Promise<T>): Promise<T> => {
   }
 })()
 
-// ------------------------------------------------ Server Guard (T94) -----
-// ≤1 dev server per repo/folder: probe registry (DEVATA/servers.json) by
-// canonical path + kind. Live PID → reuse; dead/orphaned → kill + cleanup;
-// none → spawn via factory, record entry. Survives plugin reloads.
-interface ServerEntry {
-  pid: number
-  port: number
-  startedAt: string
-  kind: string
-  canonicalPath: string
-  owner?: string // кто держит (panel = сама консоль)
-  reserved_for?: string // T94: бронь голове очереди после release (pid=0)
-  reserved_at?: string // T94: время брони — живёт SERVER_RESERVE_TTL_MS
-}
-
-interface ServerRegistry {
-  // КЛЮЧ = путь + вид (canonicalPath::kind). До 11.11 ключ был только путём:
-  // панель-канал и тест-сервер одного репо затирали друг друга (а заодно
-  // ломалась бронь очереди). Теперь вид — часть ключа: ≤1 сервер на (репо, вид).
-  [slot: string]: ServerEntry
-}
-
-const SERVER_REGISTRY_FILE = "servers.json"
-// T94-очередь ожидающих сервер репо (детерминированно, без ИИ-логики)
-const SERVER_QUEUE_FILE = "servers.queue.json"
-
-// T94: фоновой запуск команды задачи (dev/test-сервер). detached + тихий вывод:
-// консоль не должна мигать окном и не должна держать процесс за собой.
-// Возвращает pid — он же попадает в реестр (потом сервер можно переиспользовать).
-function spawnDetached(cmd: string, cwd: string): { pid: number } | null {
-  try {
-    const child = spawn(cmd, {
-      cwd: existsSync(cwd) ? cwd : undefined,
-      shell: true,
-      detached: true,
-      windowsHide: true,
-      stdio: "ignore",
-    })
-    child.unref()
-    if (typeof child.pid !== "number" || child.pid <= 0) return null
-    return { pid: child.pid }
-  } catch (e) {
-    console.error("[dev-console] spawnDetached:", e)
-    return null
-  }
-}
-
-class ServerGuard {
-  private registry: ServerRegistry = {}
-  private root: string
-  private loaded = false
-
-  constructor(root: string) {
-    this.root = root
-  }
-
-  private registryPath(): string {
-    return join(this.root, "DEVATA", SERVER_REGISTRY_FILE)
-  }
-
-  private load(): void {
-    if (this.loaded) return
-    this.loaded = true
-    const path = this.registryPath()
-    if (!existsSync(path)) return
-    try {
-      const raw = readFileSync(path, "utf8").trim()
-      if (raw) this.registry = JSON.parse(raw) as ServerRegistry
-    } catch (e) {
-      console.error("[dev-console] ServerGuard: failed to load registry:", e)
-      this.registry = {}
-    }
-  }
-
-  private save(): void {
-    try {
-      const path = this.registryPath()
-      const dir = join(this.root, "DEVATA")
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-      writeFileSync(path, JSON.stringify(this.registry, null, 2), "utf8")
-    } catch (e) {
-      console.error("[dev-console] ServerGuard: failed to save registry:", e)
-    }
-  }
-
-  // Check if a PID is alive on Windows (tasklist)
-  private isPidAlive(pid: number): boolean {
-    try {
-      // windowsHide: спрятать окно консоли (жалоба Основателя 08.10: мигание cmd/PowerShell)
-      const result = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/NH", "/FO", "CSV"], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        windowsHide: true,
-      })
-      const out = result.stdout?.toString() ?? ""
-      return out.includes(`"${pid}"`)
-    } catch {
-      return false
-    }
-  }
-
-  // Check if a port is in use (netstat)
-  private isPortInUse(port: number): boolean {
-    return this.portOwner(port) !== null
-  }
-
-  // Кто РЕАЛЬНО слушает порт (pid из netstat -ano). Нужно для честной живости:
-  // слот «тест-сервер ARTHUR:8765» мог остаться в реестре, пока порт держал
-  // уже другой процесс (питон галереи) — reuse обязан отдать ТОГО, кто слушает.
-  private portOwner(port: number): number | null {
-    try {
-      const result = spawnSync("netstat", ["-ano", "-p", "TCP"], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        windowsHide: true,
-      })
-      const out = result.stdout?.toString() ?? ""
-      for (const line of out.split(/\r?\n/)) {
-        if (!line.includes("LISTENING")) continue
-        if (!line.includes(`:${port} `)) continue
-        const m = line.trim().match(/\s(\d+)\s*$/)
-        if (m) {
-          const pid = Number(m[1])
-          if (Number.isFinite(pid) && pid > 0) return pid
-        }
-      }
-      return null
-    } catch {
-      return null
-    }
-  }
-
-  // Kill a PID (taskkill /F)
-  private killPid(pid: number): boolean {
-    try {
-      spawnSync("taskkill", ["/F", "/PID", String(pid)], {
-        stdio: ["ignore", "ignore", "ignore"],
-        windowsHide: true,
-      })
-      return true
-    } catch {
-      return false
-    }
-  }
-
-  // Clean up orphaned entries on load
-  private cleanupOrphans(): void {
-    let changed = false
-    for (const [slot, entry] of Object.entries(this.registry)) {
-      // T94: бронь (pid=0, reserved_for) — не сирота; живёт до TTL или до спавна
-      if (entry.pid === 0 && serverReservationActive(entry)) continue
-      const pidAlive = this.isPidAlive(entry.pid)
-      const portAlive = this.isPortInUse(entry.port)
-      if (!pidAlive || !portAlive) {
-        // SAFETY (оркестратор, T94 12:05): НИКОГДА не убивать хост-процесс —
-        // панель-канал живёт ВНУТРИ сервиса (entry.pid === process.pid), и
-        // «порт умер при живом хосте» (гонка/ошибка netstat) означал бы
-        // taskkill всего opencode-сервиса = инцидент-класс (не рестартовать).
-        // Хост-запись просто удаляем — listener поднимется заново.
-        if (pidAlive && entry.pid !== process.pid) this.killPid(entry.pid)
-        console.log(
-          `[dev-console] ServerGuard: cleaned orphan ${entry.kind} for ${entry.canonicalPath} (pid=${entry.pid}, port=${entry.port}, pidAlive=${pidAlive}, portAlive=${portAlive})`,
-        )
-        delete this.registry[slot]
-        changed = true
-      }
-    }
-    if (changed) this.save()
-  }
-
-  private queuePath(): string {
-    return join(this.root, "DEVATA", SERVER_QUEUE_FILE)
-  }
-
-  private loadQueue(): ServerWaiter[] {
-    const path = this.queuePath()
-    if (!existsSync(path)) return []
-    try {
-      const raw = readFileSync(path, "utf8").trim()
-      const arr = raw ? (JSON.parse(raw) as unknown) : []
-      return Array.isArray(arr) ? (arr as ServerWaiter[]) : []
-    } catch (e) {
-      console.error("[dev-console] ServerGuard: failed to load queue:", e)
-      return []
-    }
-  }
-
-  private saveQueue(q: ServerWaiter[]): void {
-    try {
-      const dir = join(this.root, "DEVATA")
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-      writeFileSync(this.queuePath(), JSON.stringify(q, null, 2), "utf8")
-    } catch (e) {
-      console.error("[dev-console] ServerGuard: failed to save queue:", e)
-    }
-  }
-
-  // T94: встать в очередь на сервер репо. Идемпотентно; возвращает позицию (1-based).
-  enqueue(canonicalPath: string, kind: string, owner: string): number {
-    const q = serverQueueAdd(this.loadQueue(), { path: canonicalPath, owner, kind, since: new Date().toISOString() })
-    this.saveQueue(q)
-    const idx = q.findIndex((x) => x.path === canonicalPath && x.owner === owner && x.kind === kind)
-    return idx < 0 ? 0 : idx + 1
-  }
-
-  // Слот реестра: путь + вид. Панель-канал и тест-сервер одного репо — разные
-  // слоты (до 11.11 ключ был только путём → затирали друг друга).
-  private slotKey(canonicalPath: string, kind: string): string {
-    return `${canonicalPath}::${kind}`
-  }
-
-  // Живой сервер в слоте (порт слушает) — для решения reuse/spawn/queue.
-  // Владелец порта сверяется с netstat: запись реестра может устареть (сервер
-  // перезапущен руками) — тогда ПРАВДА = тот, кто реально слушает порт.
-  liveIn(canonicalPath: string, kind: string): { pid: number; port: number } | null {
-    this.load()
-    const entry = this.registry[this.slotKey(canonicalPath, kind)]
-    if (!entry || entry.pid === 0) return null
-    if (!this.isPortInUse(entry.port)) return null
-    const owner = this.portOwner(entry.port)
-    if (owner === null) return null
-    if (owner !== entry.pid) {
-      // Порт перехвачен другим процессом — перепривязываем запись на него
-      // (сервер жив, просто не тот pid: reuse обязан отдать рабочий порт).
-      entry.pid = owner
-      this.save()
-      console.log(
-        `[dev-console] ServerGuard: ${kind} для ${canonicalPath} — порт ${entry.port} держит pid=${owner} (в реестре был ${entry.pid}) → перепривязано`,
-      )
-    }
-    return { pid: owner, port: entry.port }
-  }
-
-  // Зарегистрировать поднятый задачей сервер (тот же путь, что и панель-канал):
-  // следующий запрос по (репо, вид) получит reuse вместо второго спавна.
-  register(canonicalPath: string, kind: string, pid: number, port: number, owner: string): void {
-    this.load()
-    this.registry[this.slotKey(canonicalPath, kind)] = {
-      pid,
-      port,
-      startedAt: new Date().toISOString(),
-      kind,
-      canonicalPath,
-      owner,
-    }
-    this.save()
-  }
-
-  // Кто держит бронь на слот (или null).
-  reservedIn(canonicalPath: string, kind: string): string | null {
-    this.load()
-    const entry = this.registry[this.slotKey(canonicalPath, kind)]
-    if (!entry || entry.pid !== 0) return null
-    if (!serverReservationActive(entry)) return null
-    return entry.reserved_for ?? null
-  }
-
-  // Очередь ожидающих по (репо, вид).
-  waitersFor(canonicalPath: string, kind: string): ServerWaiter[] {
-    return this.loadQueue().filter((q) => q.path === canonicalPath && q.kind === kind)
-  }
-
-  // Public: spawn or reuse a server for a directory + kind
-  // factory = () => Promise<{ port: number; pid: number }>
-  async spawn<T extends { port: number; pid: number }>(
-    canonicalPath: string,
-    kind: string,
-    factory: () => Promise<T>,
-    owner: string = "panel",
-  ): Promise<T & { reused: boolean }> {
-    this.load()
-    this.cleanupOrphans()
-
-    const slot = this.slotKey(canonicalPath, kind)
-    const existing = this.registry[slot]
-    if (existing && existing.kind === kind) {
-      // T94 (заказ 11.11): бронь после release (pid=0) — владелец забирает сам,
-      // остальные детерминированно встают в очередь; протухшая бронь снимается.
-      const reserved = existing.pid === 0 && serverReservationActive(existing)
-      if (reserved && existing.reserved_for !== owner && owner !== "panel") {
-        const pos = this.enqueue(canonicalPath, kind, owner)
-        throw new Error(`server busy: ${canonicalPath} зарезервирован за ${existing.reserved_for} (ты #${pos} в очереди)`)
-      }
-      if (reserved) {
-        delete this.registry[slot]
-        this.save()
-        console.log(`[dev-console] ServerGuard: RESERVATION taken by ${owner} for ${canonicalPath}`)
-      } else if (existing.pid !== 0) {
-        const pidAlive = this.isPidAlive(existing.pid)
-        const portAlive = this.isPortInUse(existing.port)
-        if (pidAlive && portAlive) {
-          console.log(`[dev-console] ServerGuard: REUSE ${kind} for ${canonicalPath} → pid=${existing.pid}, port=${existing.port}`)
-          return { port: existing.port, pid: existing.pid, reused: true } as T & { reused: boolean }
-        }
-        // Dead/orphaned → remove; kill только ЧУЖОЙ процесс, не хост (SAFETY выше)
-        if (pidAlive && existing.pid !== process.pid) this.killPid(existing.pid)
-        console.log(`[dev-console] ServerGuard: ORPHAN cleanup ${kind} for ${canonicalPath} (pid=${existing.pid}, port=${existing.port})`)
-        delete this.registry[slot]
-        this.save()
-      }
-    }
-
-    // Spawn new
-    console.log(`[dev-console] ServerGuard: SPAWN ${kind} for ${canonicalPath}`)
-    const result = await factory()
-    this.registry[slot] = {
-      pid: result.pid,
-      port: result.port,
-      startedAt: new Date().toISOString(),
-      kind,
-      canonicalPath,
-      owner,
-    }
-    this.save()
-    return { ...result, reused: false }
-  }
-
-  // Get existing entry without spawning
-  get(canonicalPath: string, kind = "panel-channel"): ServerEntry | null {
-    this.load()
-    return this.registry[this.slotKey(canonicalPath, kind)] ?? null
-  }
-
-  // Remove entry (e.g., on explicit shutdown) + T94: автодерг ожидающего —
-  // release передаёт бронь ГОЛОВЕ очереди детерминированно (FIFO), бронь
-  // живёт SERVER_RESERVE_TTL_MS, чтобы призрак не держал сервер вечно.
-  release(canonicalPath: string, kind = "panel-channel"): { handoff: string | null; waiting: number } {
-    this.load()
-    const slot = this.slotKey(canonicalPath, kind)
-    const { next, rest } = serverQueueTake(
-      this.loadQueue().filter((q) => q.path === canonicalPath && q.kind === kind),
-      canonicalPath,
-    )
-    delete this.registry[slot]
-    if (next) {
-      this.registry[slot] = {
-        pid: 0,
-        port: 0,
-        startedAt: new Date().toISOString(),
-        kind: next.kind,
-        canonicalPath,
-        reserved_for: next.owner,
-        reserved_at: new Date().toISOString(),
-      }
-      // Очередь фильтруем по (путь, вид) — остальные слоты не трогаем.
-      const others = this.loadQueue().filter((q) => !(q.path === canonicalPath && q.kind === kind))
-      this.saveQueue([...others, ...rest.filter((q) => q.path !== canonicalPath || q.kind !== kind)])
-      console.log(`[dev-console] ServerGuard: RELEASE ${canonicalPath} → бронь ${next.owner} (ждут ещё ${rest.length})`)
-    } else {
-      const others = this.loadQueue().filter((q) => !(q.path === canonicalPath && q.kind === kind))
-      this.saveQueue(others)
-    }
-    this.save()
-    return { handoff: next?.owner ?? null, waiting: rest.length }
-  }
-}
-
-// Export for use in spawn paths
-let serverGuard: ServerGuard
-
 // ------------------------------------------------ plugin setup -------------
 
 const INPUT = {
@@ -546,8 +191,9 @@ const INPUT = {
   properties: {
     op: {
       type: "string",
-      enum: ["get_state", "create", "update", "set_state", "model_reset"],
+      enum: ["get_state", "create", "update", "set_state", "model_reset", "progress"],
       description:
+        "progress: executor-only self-report (step/done/next/eta_remaining_min); identity is bound by runtime sessionID. " +
         "get_state: read projection (call before any status response). create: Founder-requested task " +
         "(starts WAIT; `parent` = decomposition child). update: change task text / owner (null clears). " +
         "set_state: DOING|WAIT|BLOCKED|GATE|DONE — BLOCKED/GATE need `why`, DONE needs `verification` " +
@@ -579,6 +225,10 @@ const INPUT = {
     est_min: { type: "number", description: "Explicit phase estimate in minutes (model-provided; overrides auto-estimation from history)" },
     // T38: Phase tag for grouping history (e.g., "impl", "review", "test")
     phase: { type: "string", description: "Phase tag for history grouping (e.g., 'impl', 'review', 'test')" },
+    step: { type: "string", description: "progress only: current meaningful work step (1–180 chars)" },
+    done: { type: ["string", "number", "null"], description: "progress only: concise self-reported checkpoint, e.g. 3/10" },
+    next: { type: ["string", "null"], description: "progress only: next concrete action" },
+    eta_remaining_min: { type: ["number", "null"], description: "progress only: self-reported remaining minutes, 0–1440; not the original plan ETA" },
   },
   required: ["op"],
   additionalProperties: false,
@@ -590,7 +240,8 @@ const DESCRIPTION =
   "pane (DEVATA/CONSOLE_UI.html); chat replies are short comments — paste `ui` only if the pane is " +
   "unavailable. Record only real events. DONE is terminal and needs verification; a rejected transition is final — " +
   "fix the record, don't retry. DOING + owner (sent with set_state/update) → the runtime dispatches the background agent " +
-  "(`dispatched` in the response), never spawn manually; no owner = this thread works inline."
+  "(`dispatched` in the response), never spawn manually; no owner = this thread works inline. " +
+  "Executors may call only progress to report their own step; they cannot create/update tasks or read/change the ledger."
 
 export default Plugin.define({
   id: "dev-console",
@@ -675,7 +326,7 @@ export default Plugin.define({
     }
 
     // Initialize ServerGuard with canonical root (T94: ≤1 dev server per repo/folder)
-    serverGuard = new ServerGuard(root)
+    const serverGuard = new ServerGuard(root)
     let locCheckedAt = 0
     // Ветка живёт в git, а рендер синхронный: обновляем кэш фоном (не чаще раза
     // в 30с), сама запись панели от этого не зависит.
@@ -695,6 +346,15 @@ export default Plugin.define({
       tool_hooks: boolean
       session_hook: boolean
       event_stream: boolean
+      event_reconnects: number
+      event_errors: number
+      event_last_error: string | null
+      event_last_at: string | null
+      agent_progress_reports: number
+      agent_tool_events: number
+      agent_tool_resyncs: number
+      agent_usage_events: number
+      agent_requests: number
       cpu_monitors: string | null // T138: «погасить мониторы» — off@timestamp кнопкой панели (T164: поле больше не пишется — кнопка гасит ЭКРАНЫ)
       screens_off: string | null // T164: экраны погашены кнопкой (SC_MONITORPOWER=2) — off@timestamp
       injections: number
@@ -759,6 +419,15 @@ export default Plugin.define({
       tool_hooks: false,
       session_hook: false,
       event_stream: false,
+      event_reconnects: 0,
+      event_errors: 0,
+      event_last_error: null,
+      event_last_at: null,
+      agent_progress_reports: 0,
+      agent_tool_events: 0,
+      agent_tool_resyncs: 0,
+      agent_usage_events: 0,
+      agent_requests: 0,
       injections: 0,
       injections_full: 0,
       injections_cheap: 0,
@@ -2018,7 +1687,7 @@ export default Plugin.define({
           const began = Date.parse(agent.began_at)
           const durationSec = Math.max(1, (settleAt - began) / 1000)
           const editsPerSec = editCount / durationSec
-          if (status === "completed") recordModelResultByClass(ledger, agent.model, cls, true, editsPerSec)
+          if (status === "completed") recordModelResultByClass(ledger, agent.model, cls, true, editsPerSec, undefined, false)
         }
       }
       
@@ -2563,7 +2232,7 @@ export default Plugin.define({
               const began = Date.parse(agent.began_at)
               const durationSec = Math.max(1, (Date.now() - (Number.isFinite(began) ? began : Date.now())) / 1000)
               const eps = (agent.edit_count ?? 0) / durationSec
-              recordModelResultByClass(l, agent.model, cls, false, eps, errClass)
+              recordModelResultByClass(l, agent.model, cls, false, eps, errClass, false)
             }
           }
           if (markAgentError(l, taskId, classified)) save(l)
@@ -2694,8 +2363,11 @@ export default Plugin.define({
     // выбора; каталог остаётся для ручных спавнов (personaPromptBlock(null)).
     const dispatchPrompt = (task: Task, parent: Persona | null, cls: TaskClass | null): string =>
       `[${task.id}] ${task.task}\n\n` +
-      "Dispatched executor; the orchestrator records the outcome — you have no console (dev_console), " +
-      "never call it. Read DEVATA/PIPELINE_PROJECT.md if present (models, tests, protected paths). " +
+      "Dispatched executor. The framework owns orchestration and the ledger. You may call dev_console " +
+      "ONLY with op=progress to self-report your own current step (step, done, next, eta_remaining_min); " +
+      "the runtime binds your identity from this session, so never supply an agent/task/session id. " +
+      "Send a short report after meaningful milestones, when blocked, and before finishing — not after every tiny action. " +
+      "All other dev_console operations are forbidden for executors. Read DEVATA/PIPELINE_PROJECT.md if present (models, tests, protected paths). " +
       "Complete the task, verify it, reply with the result (≤10 lines).\n\n" +
       // T97(в) orientation-прелюдия: первое действие ребёнка — tool-вызов.
       "ORIENTATION (T97): your FIRST action MUST be a tool call (`ls` the repo, read the task, read a file). " +
@@ -3001,6 +2673,7 @@ export default Plugin.define({
             home: source, // вкладка, распорядившаяся задачей — для данных о вкладках
             model: shortModelKey(policyModel), // T82: model speed coefficient for ETA scaling
             cross: crossEta, // T116: кросс-опыт имени инстанса докручивает ETA-историю
+            idFile: stateFile,
           })
           await save(l)
           return a
@@ -3112,6 +2785,25 @@ export default Plugin.define({
             })
           }
           try {
+            // T240: the only executor write path. Identity is the invoking session;
+            // never accept an agent/task/session id from model-controlled input.
+            const callerSession = typeof context.sessionID === "string" ? context.sessionID : ""
+            const callerLedger = loadLedger(stateFile)
+            const callerAgent = callerSession ? callerLedger.agents.find((a) => a.session_ref === callerSession) : undefined
+            if (callerAgent && input.op !== "progress") {
+              return { content: JSON.stringify({ ok: false, error: "executor permission: only op=progress is allowed" }) }
+            }
+            if (input.op === "progress") {
+              if (!callerAgent || (callerAgent.state !== "running" && callerAgent.state !== "waiting")) {
+                return { content: JSON.stringify({ ok: false, error: "progress is available only to the live agent owning this session" }) }
+              }
+              const agent = noteAgentProgress(callerLedger, callerSession, input)
+              if (!agent) return { content: JSON.stringify({ ok: false, error: "agent session is not live or is not registered" }) }
+              await save(callerLedger)
+              diag.agent_progress_reports += 1
+              progress(project(loadLedger(stateFile)))
+              return { content: JSON.stringify({ ok: true, op: "progress", agent: agent.id, updated_at: agent.progress?.updated_at, source: "self-report" }) }
+            }
             if (discoverSpawn) await discoverSpawn() // lazy retry: the spawn tool may register after load
             if (input.op === "get_state") {
               const { ledger, projection } = read()
@@ -3183,7 +2875,7 @@ export default Plugin.define({
             // Поле навязывается рантаймом: модель session_ref передать не может.
             const caller = typeof context.sessionID === "string" ? context.sessionID : ""
             const attributed = caller && ledger.tabs.some((t) => t.session_id === caller) ? caller : lastTopSession
-            const outcome = applyOp(ledger, { ...input, session_ref: attributed })
+            const outcome = applyOp(ledger, { ...input, session_ref: attributed }, { idFile: stateFile })
             if (!outcome.ok) {
               // Error + current truth (slim), so a failed op still leaves fresh state in context.
               progress(projection)
@@ -3305,7 +2997,7 @@ export default Plugin.define({
               // иначе последняя активная (спавн из ребёнка/исполнителя).
               const called = typeof event.sessionID === "string" ? event.sessionID : ""
               const home = called && ledger.tabs.some((t) => t.session_id === called) ? called : lastTopSession
-              const agent = beginAgent(ledger, { input: event.input, ref: refOf(event), home })
+              const agent = beginAgent(ledger, { input: event.input, ref: refOf(event), home, idFile: stateFile })
               save(ledger)
               scheduleEta(agent)
               console.log(
@@ -3779,6 +3471,84 @@ export default Plugin.define({
     // (T60) из среза уходят: их живой титул = глиф цикла, а не имя.
     // Изменения → save (перерисовка панели); без изменений диск не трогаем.
     const TAB_FEED_MS = 15_000
+    // Last-tool snapshots are reconstructed from the last few projected messages
+    // after reconnects/event gaps. Throttled per child; usage comes from /api/session.
+    const toolSyncAt = new Map<string, number>()
+    let toolSyncBusy = false
+    const syncChildToolSnapshots = (ep: { url: string; auth?: string }, children: ReturnType<typeof parseChildFeed>): void => {
+      if (toolSyncBusy || children.length === 0) return
+      void (async () => {
+        toolSyncBusy = true
+        try {
+          let latestLedger = loadLedger(stateFile)
+          const pending = children.filter((child) => {
+            const agent = latestLedger.agents.find((a) => a.session_ref === child.session_id && (a.state === "running" || a.state === "waiting"))
+            return !!agent && Date.now() - (toolSyncAt.get(child.session_id) ?? 0) >= 30_000
+          }).slice(0, 8)
+          for (const child of pending) toolSyncAt.set(child.session_id, Date.now())
+          let changed = false
+          for (const child of pending) {
+            try {
+              const url = `${ep.url}/api/session/${encodeURIComponent(child.session_id)}/message?limit=8&order=desc`
+              const options = (auth?: string): RequestInit => ({
+                headers: auth ? { authorization: auth } : {},
+                signal: typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(3_000) : undefined,
+              })
+              let response = await fetch(url, options(ep.auth))
+              if (response.status === 401 && ep.auth) response = await fetch(url, options())
+              if (!response.ok) continue
+              const payload = await response.json() as unknown
+              const messages = Array.isArray(payload) ? payload : ((payload as { data?: unknown })?.data ?? [])
+              if (!Array.isArray(messages)) continue
+              let latest: { name: string; target: string | null; callId: string | null; at: string; ms: number } | null = null
+              for (const rawMessage of messages) {
+                if (!rawMessage || typeof rawMessage !== "object") continue
+                const message = rawMessage as Record<string, unknown>
+                const info = message.info && typeof message.info === "object" ? message.info as Record<string, unknown> : {}
+                const messageTime = info.time && typeof info.time === "object" ? info.time as Record<string, unknown> : {}
+                const parts = Array.isArray(message.parts) ? message.parts : Array.isArray(message.content) ? message.content : []
+                for (const rawPart of parts) {
+                  if (!rawPart || typeof rawPart !== "object") continue
+                  const part = rawPart as Record<string, unknown>
+                  const toolName = typeof part.tool === "string" ? part.tool : typeof part.name === "string" ? part.name : null
+                  if (part.type !== "tool" || !toolName) continue
+                  const state = part.state && typeof part.state === "object" ? part.state as Record<string, unknown> : {}
+                  const inputValue = state.input ?? part.input
+                  const input = inputValue && typeof inputValue === "object" ? inputValue : null
+                  const stateTime = state.time && typeof state.time === "object" ? state.time as Record<string, unknown> : {}
+                  const partTime = part.time && typeof part.time === "object" ? part.time as Record<string, unknown> : {}
+                  const ms = typeof stateTime.start === "number" ? stateTime.start : typeof partTime.ran === "number" ? partTime.ran : typeof partTime.start === "number" ? partTime.start : typeof messageTime.created === "number" ? messageTime.created : 0
+                  if (latest && ms <= latest.ms) continue
+                  let target: string | null = null
+                  if (input && typeof input === "object") {
+                    const values = input as Record<string, unknown>
+                    for (const key of ["filePath", "path", "file", "url", "uri", "resource", "command", "cmd", "description", "prompt", "search", "query", "pattern", "glob", "directory", "target"]) {
+                      const value = values[key]
+                      if (typeof value === "string" && value.trim() !== "") { target = value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").slice(0, 80); break }
+                    }
+                  }
+                  if (!target && typeof state.title === "string") target = state.title.slice(0, 80)
+                  latest = { name: toolName, target, callId: typeof part.callID === "string" ? part.callID : typeof part.id === "string" ? part.id : null, at: new Date(ms || Date.now()).toISOString(), ms }
+                }
+              }
+              if (latest) {
+                const current = loadLedger(stateFile)
+                if (noteAgentTool(current, child.session_id, latest.name, latest.target, latest.at, latest.callId)) {
+                  latestLedger = current
+                  changed = true
+                }
+              }
+              diag.agent_tool_resyncs += 1
+            } catch {
+              // Tool history is best-effort; never stall the main tab/usage feed.
+            }
+          }
+          if (changed) await save(latestLedger)
+        } finally {
+          toolSyncBusy = false
+        }
+      })()
+    }
     let feedBusy = false
     const pollTabFeed = async (): Promise<void> => {
       if (feedBusy) return // один срез за раз (таймер ≠ десять параллельных)
@@ -3828,6 +3598,8 @@ export default Plugin.define({
           )
           .map((t) => ({ session_id: t.session_id, title: t.title, last_seen: t.last_seen }))
         diag.ghost_tabs = ghosts
+        const childItems = parseChildFeed(raw, root)
+        syncChildToolSnapshots(ep, childItems)
         const items = parseSessionFeed(raw, root).filter((i) => !blinkTimers.has(i.session_id))
         diag.tab_feed = items.length
         diag.tab_feed_err = null
@@ -3839,7 +3611,7 @@ export default Plugin.define({
         const l = loadLedger(stateFile)
         const changed = applyTabFeed(l, items)
         // T170: субагенты-дети (parentID) из того же фида — строки-боты под вкладкой
-        const kidCount = attachTabChildren(l, parseChildFeed(raw, root))
+        const kidCount = attachTabChildren(l, childItems)
         if (changed > 0 || kidCount > 0 || headerChanged) {
           if (changed > 0 || kidCount > 0) await save(l)
           else renderPane(l) // только квота изменилась — диск не трогаем, рендерим
@@ -3943,6 +3715,7 @@ export default Plugin.define({
                     input: { agent: "general", description: info.title ?? "child session" },
                     ref: sessionID,
                     home: lastTopSession, // вкладка, запустившая ребёнка (best effort)
+                    idFile: stateFile,
                   })
                   save(l)
                   diag.context_recorded += 1
@@ -4047,16 +3820,51 @@ export default Plugin.define({
         void (async () => {
           type ServerEvent = {
             type?: string
+            created?: number
+            time?: number
             durable?: { aggregateID?: string }
             data?: {
               sessionID?: string
+              name?: unknown
+              id?: unknown
+              text?: unknown
+              input?: unknown
+              part?: unknown
+              cost?: unknown
+              tokens?: unknown
               item?: { payload?: { text?: string; metadata?: { childID?: string } } }
+              [key: string]: unknown
             }
           }
-          for await (const raw of eventApi.subscribe!({ signal: stopEvents.signal })) {
-            const e = raw as ServerEvent
-            const type = e.type ?? ""
-            const subject = e.durable?.aggregateID ?? e.data?.sessionID ?? null
+          const toolTarget = (value: unknown): string | null => {
+            if (!value || typeof value !== "object") return null
+            const record = value as Record<string, unknown>
+            for (const key of ["filePath", "path", "file", "url", "uri", "resource", "command", "cmd", "description", "prompt", "search", "query", "pattern", "glob", "directory", "target"]) {
+              const candidate = record[key]
+              if (typeof candidate === "string" && candidate.trim() !== "") return candidate.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").slice(0, 80)
+            }
+            return null
+          }
+          const observeTool = (subject: string, name: unknown, input: unknown, callId: unknown, at: string): void => {
+            if (typeof name !== "string" || name.trim() === "") return
+            const ledger = loadLedger(stateFile)
+            if (noteAgentTool(ledger, subject, name, toolTarget(input), at, typeof callId === "string" ? callId : null)) {
+              diag.agent_tool_events += 1
+              void save(ledger)
+            }
+          }
+          let retryMs = 1_000
+          while (!stopEvents.signal.aborted) {
+            try {
+              diag.event_stream = true
+              for await (const raw of eventApi.subscribe!({ signal: stopEvents.signal })) {
+                const e = raw as ServerEvent
+                const type = e.type ?? ""
+                const subject = e.durable?.aggregateID ?? e.data?.sessionID ?? null
+                diag.event_stream = true
+                diag.event_last_at = new Date().toISOString()
+                diag.event_last_error = null
+                retryMs = 1_000
             // T52: свежесть последнего события сессии (ЛЮБОГО, не только succeeded)
             // — именно она делает «тишину» terminal-признаком; ход её обновляет.
             if (subject) noteSessionActivity(subject)
@@ -4070,6 +3878,72 @@ export default Plugin.define({
               if (at - acc.last <= EFF_GAP_MS) acc.ms += at - acc.last
               acc.last = at
               effActivityAcc.set(subject, acc)
+            }
+            // T240: live per-agent telemetry. OpenCode emits input.started(name),
+            // input.ended(text), tool.called(input), and absolute usage.updated(cost,tokens).
+            // /api/session polling is the reconnect/catch-up snapshot; usage snapshots replace, never sum.
+            if (subject && type === "message.part.updated") {
+              // OpenCode V1 projected transcript event: tool part carries tool/callID/state.input.
+              const d = (e.data ?? {}) as Record<string, unknown>
+              const part = d.part && typeof d.part === "object" ? d.part as Record<string, unknown> : {}
+              const state = part.state && typeof part.state === "object" ? part.state as Record<string, unknown> : {}
+              const input = state.input && typeof state.input === "object" ? state.input : null
+              const stateTime = state.time && typeof state.time === "object" ? state.time as Record<string, unknown> : {}
+              const partTime = part.time && typeof part.time === "object" ? part.time as Record<string, unknown> : {}
+              const stamp = typeof stateTime.start === "number" ? stateTime.start : typeof partTime.ran === "number" ? partTime.ran : typeof partTime.start === "number" ? partTime.start : typeof e.time === "number" ? e.time : typeof e.created === "number" ? e.created : Date.now()
+              const toolName = typeof part.tool === "string" ? part.tool : part.name
+              const toolInput = input ?? (part.input && typeof part.input === "object" ? part.input : null)
+              const callId = typeof part.callID === "string" ? part.callID : part.id
+              if (part.type === "tool") observeTool(subject, toolName, toolInput, callId, new Date(stamp).toISOString())
+            } else if (subject && (type === "session.tool.input.started" || type === "session.tool.called")) {
+              const d = (e.data ?? {}) as Record<string, unknown>
+              const input = d.input && typeof d.input === "object" ? d.input as Record<string, unknown> : {}
+              const name = typeof d.name === "string" ? d.name : typeof input.tool === "string" ? input.tool : null
+              observeTool(subject, name, input, d.id, typeof e.created === "number" ? new Date(e.created).toISOString() : new Date().toISOString())
+            } else if (subject && type === "session.tool.input.ended") {
+              const d = (e.data ?? {}) as Record<string, unknown>
+              const rawInput = typeof d.text === "string" ? d.text : ""
+              let parsed: Record<string, unknown> = {}
+              try { const value = JSON.parse(rawInput); if (value && typeof value === "object") parsed = value as Record<string, unknown> } catch { /* malformed tool input is not fatal */ }
+              const target = toolTarget(parsed)
+              const ledger = loadLedger(stateFile)
+              const agent = ledger.agents.find((a) => a.session_ref === subject && (a.state === "running" || a.state === "waiting"))
+              const callId = typeof d.id === "string" ? d.id : null
+              if (agent?.last_tool && (!callId || !agent.last_tool.call_id || agent.last_tool.call_id === callId)) {
+                agent.last_tool.target = target ? target.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").slice(0, 80) : agent.last_tool.target
+                agent.last_tool.updated_at = typeof e.created === "number" ? new Date(e.created).toISOString() : new Date().toISOString()
+                void save(ledger)
+              }
+            } else if (subject && type === "message.updated") {
+              // Count unique completed assistant messages as model turns, not tool calls or provider retries.
+              const d = (e.data ?? {}) as Record<string, unknown>
+              const info = d.info && typeof d.info === "object" ? d.info as Record<string, unknown> : {}
+              const time = info.time && typeof info.time === "object" ? info.time as Record<string, unknown> : {}
+              if (info.role === "assistant" && typeof info.id === "string" && typeof time.completed === "number") {
+                const ledger = loadLedger(stateFile)
+                if (noteAgentRequest(ledger, subject, info.id)) {
+                  diag.agent_requests += 1
+                  void save(ledger)
+                }
+              }
+            } else if (subject && type === "session.step.ended") {
+              // V2 step boundary carries assistantMessageID. Deduped with message.updated.
+              const d = (e.data ?? {}) as Record<string, unknown>
+              const messageId = typeof d.assistantMessageID === "string" ? d.assistantMessageID : typeof d.assistantMessageId === "string" ? d.assistantMessageId : null
+              if (messageId) {
+                const ledger = loadLedger(stateFile)
+                if (noteAgentRequest(ledger, subject, messageId)) {
+                  diag.agent_requests += 1
+                  void save(ledger)
+                }
+              }
+            } else if (subject && type === "session.usage.updated") {
+              const ledger = loadLedger(stateFile)
+              const usageAt = typeof e.time === "number" ? e.time : typeof e.created === "number" ? e.created : Date.now()
+              if (noteAgentUsage(ledger, subject, e.data, new Date(usageAt).toISOString(), "usage-event")) {
+                diag.agent_usage_events += 1
+                void save(ledger)
+              }
             }
             // T97(в): tool-вызов в этом ходу — ход считается не-пустым.
             if (type === "session.tool.called" && subject) turnHadTool.set(subject, true)
@@ -4155,8 +4029,21 @@ export default Plugin.define({
                 `[dev-console] incident: ${type} — общий сбой рантайма/репо (не привязан к вкладке).`,
               )
             }
+              }
+              if (!stopEvents.signal.aborted) throw new Error("event stream ended")
+            } catch (e) {
+              if (stopEvents.signal.aborted) break
+              diag.event_stream = false
+              diag.event_errors += 1
+              diag.event_last_error = String(e).slice(0, 240)
+              console.error("[dev-console] event stream disconnected; retrying:", e)
+              await new Promise((resolve) => setTimeout(resolve, retryMs))
+              if (stopEvents.signal.aborted) break
+              diag.event_reconnects += 1
+              retryMs = Math.min(retryMs * 2, 15_000)
+            }
           }
-        })().catch((e) => console.error("[dev-console] stage2 events:", e))
+        })().catch((e) => console.error("[dev-console] stage2 event supervisor:", e))
         diag.event_stream = true
       } catch (e) {
         console.error("[dev-console] stage2 event subscribe failed:", e)

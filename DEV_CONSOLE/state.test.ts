@@ -1,13 +1,14 @@
 // Tests for the DEV CONSOLE state core.
 // Run: node --experimental-strip-types --test DEV_CONSOLE/state.test.ts
 
-import { test } from "node:test"
+import { after, test } from "node:test"
 import assert from "node:assert/strict"
+import { spawn } from "node:child_process"
 import fs from "node:fs"
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
-import { applyOp, applyTabFeed, autoBlinkAction, beginAgent, batchHorizon, BLINK_GLYPHS, blinkCycle, blinkRestore, calcInstanceSpeed, calcRepoSpeed, chooseChildModel, chooseModelByClass, childModelAllowed, CHILD_KEY_TO_MODEL, CHILD_KEYS, CHILD_MODELS, childPool, COOLDOWN_MS, DAEMON_EMOJI, demonName, DEMON_MODEL, describeTab, dropOwnFromForeign, EFF_GAP_MS, ensureTabEff, errorTextOfPayload, flushTabEffActivity, formatCountersSignature, formatInstanceCountersSignature, formatModelClassToken, formatOverrunSuffix, formatQuotaHeader, formatRepoSpeed, formatTabEff, FREE_POOL, freshLedger, INSTANCE_CLASS, INSTANCE_EMOJI, INSTANCE_MODEL, INSTANCE_PATH, instanceClass, instancePlanAcc, instancePool, isExecutorSession, isForeignDirectory, isForeignSession, isFreeModel, isRateLimited, learnEta, liveOverrunMin, loadLedger, liveExecutorConflict, mergeQuota, modelForKey, modelPole, modelSpeedFactor, modelStats, modelUsable, normalizeDirPath, normalizeTitle, noteTabEffWork, NEMOTRON_MODEL, noteOverrun, openTasksOf, overrunOfDay, overrunWakeReason, OVERRUN_WAKE_FACTOR, parseActiveSessions, parseConsoleQuota, parseLsFiles, parseNumstat, parseSessionFeed, parseChildFeed, attachTabChildren, personaTitle, planEtaForTask, planPercent, poleModels, project, projectCounters, projectTabs, projectWorksheet, POLICY_MODELS, applySelfReport, classifyAgentError, noSelfReportReason, noteInjection, noteOrientationCheck, NO_SELF_REPORT, NO_SELF_REPORT_MIN, ORIENTATION_N, quotaFallbackModel, quotaGuardUsage, quotaWarning, recordModelResult, recordModelResultByClass, rekeyAgent, renderConsoleHtml, reserveModel, resetModelCooldowns, ROLLING_WINDOW_MIN, rollingUsage, saveLedger, settleAgent, SETTLED_FRESH_MS, setModelCooldown, settleOnEvent, settleOnTurn, SETTLE_IDLE_MS, markAgentError, syncTabTitle, tabOverrunMin, TAB_FRESH_MS, TAB_IDLE_MS, tabStatus, taskClass, timeAwarePercent, upsertTab, wakeMessage, zombieSettleReason, type InstanceDiffSnapshot, type InstanceEditEvent, type InstanceSpeed, type Ledger, type OpInput, type TabEff, type Task, type TaskClass } from "./state.ts"
+import { dirname, join } from "node:path"
+import { applyOp, applyTabFeed, autoBlinkAction, beginAgent, batchHorizon, BLINK_GLYPHS, blinkCycle, blinkRestore, calcInstanceSpeed, calcRepoSpeed, chooseChildModel, chooseModelByClass, childModelAllowed, CHILD_KEY_TO_MODEL, CHILD_KEYS, CHILD_MODELS, childPool, COOLDOWN_MS, DAEMON_EMOJI, demonName, DEMON_MODEL, describeTab, dropOwnFromForeign, EFF_GAP_MS, ensureTabEff, errorTextOfPayload, flushTabEffActivity, formatCountersSignature, formatInstanceCountersSignature, formatModelClassToken, formatOverrunSuffix, formatQuotaHeader, formatRepoSpeed, formatTabEff, FREE_POOL, freshLedger, INSTANCE_CLASS, INSTANCE_EMOJI, INSTANCE_MODEL, INSTANCE_PATH, instanceClass, instancePlanAcc, instancePool, isExecutorSession, isForeignDirectory, isForeignSession, isFreeModel, isRateLimited, learnEta, liveOverrunMin, loadLedger, liveExecutorConflict, mergeLedger, mergeQuota, modelForKey, modelPole, modelSpeedFactor, modelStats, modelUsable, normalizeDirPath, normalizeTitle, noteTabEffWork, NEMOTRON_MODEL, noteOverrun, openTasksOf, overrunOfDay, overrunWakeReason, OVERRUN_WAKE_FACTOR, parseActiveSessions, parseConsoleQuota, parseLsFiles, parseNumstat, parseSessionFeed, parseChildFeed, attachTabChildren, personaTitle, planEtaForTask, planPercent, poleModels, project, projectCounters, projectTabs, projectWorksheet, POLICY_MODELS, applySelfReport, classifyAgentError, noSelfReportReason, noteInjection, noteAgentProgress, noteAgentUsage, noteAgentTool, noteAgentRequest, noteOrientationCheck, NO_SELF_REPORT, NO_SELF_REPORT_MIN, ORIENTATION_N, quotaFallbackModel, quotaGuardUsage, quotaWarning, recordModelResult, recordModelResultByClass, rekeyAgent, renderConsoleHtml, reserveLedgerId, reserveModel, resetModelCooldowns, ROLLING_WINDOW_MIN, rollingUsage, saveLedger, settleAgent, SETTLED_FRESH_MS, setModelCooldown, settleOnEvent, settleOnTurn, SETTLE_IDLE_MS, markAgentError, syncTabTitle, tabOverrunMin, TAB_FRESH_MS, TAB_IDLE_MS, tabStatus, taskClass, timeAwarePercent, upsertTab, wakeMessage, zombieSettleReason, type InstanceDiffSnapshot, type InstanceEditEvent, type InstanceSpeed, type Ledger, type OpInput, type TabEff, type Task, type TaskClass } from "./state.ts"
 import { cpuGate, getCpuState, isCpuProbeRunning, probeAndUpdate, resetCpuState, updateCpuState, type CpuSample } from "./cpu.ts"
 import { exportsOf, gapsIn, importsOf } from "./import_gate.ts" // T130: гейт идентификаторов (импорт↔экспорт)
 import { fileURLToPath } from "node:url"
@@ -924,6 +925,317 @@ test("T164: устаревший держатель не затирает све
     must(later, { op: "update", id: "T1", task: "новее всех" })
     saveLedger(file, later)
     assert.equal(loadLedger(file).tasks.find((t) => t.id === "T1")?.task, "новее всех", "новая мутация доходит")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("T164: точный file-stamp ловит изменения с тем же updated_at", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dev-console-stamp-"))
+  const file = join(dir, "state.json")
+  try {
+    const base = freshLedger()
+    must(base, { op: "create", task: "задача до параллельной записи" })
+    saveLedger(file, base)
+
+    const stale = loadLedger(file)
+    const external = loadLedger(file)
+    // Имитируем два изменения в одной миллисекунде: байты файла меняются,
+    // а updated_at намеренно остаётся прежним. Старый stamp пропускал merge.
+    external.tasks[0].state = "DOING"
+    external.tasks[0].owner = "external-writer"
+    external.tasks[0].updated_at = stale.tasks[0].updated_at
+    external.updated_at = stale.updated_at
+    writeFileSync(file, JSON.stringify(external, null, 2) + "\n", "utf8")
+
+    saveLedger(file, stale)
+    const saved = loadLedger(file)
+    assert.equal(saved.tasks[0].state, "DOING", "свежее содержимое не затирается совпавшим updated_at")
+    assert.equal(saved.tasks[0].owner, "external-writer")
+    assert.equal(existsSync(file + ".lock"), false, "lock освобождён после записи")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("T164: восстановление из backup не перезаписывает валидный .bak битым primary", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dev-console-backup-recovery-"))
+  const file = join(dir, "state.json")
+  try {
+    const first = freshLedger()
+    must(first, { op: "create", task: "резервный валидный снимок" })
+    saveLedger(file, first)
+    const second = loadLedger(file)
+    must(second, { op: "create", task: "последующий снимок" })
+    saveLedger(file, second)
+    const validBackup = readFileSync(file + ".bak", "utf8")
+
+    writeFileSync(file, "{ definitely not valid JSON", "utf8")
+    const recovered = loadLedger(file)
+    assert.equal(recovered.tasks.length, 1, "битый primary восстановлен из предыдущего backup")
+    saveLedger(file, recovered)
+
+    assert.equal(readFileSync(file + ".bak", "utf8"), validBackup, "битый primary не затирает последнюю валидную резервную копию")
+    assert.equal(loadLedger(file).tasks.length, 1, "восстановленный primary читается")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("T164: леджер, созданный после пустой загрузки, сливается с первым снимком", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dev-console-first-write-"))
+  const file = join(dir, "state.json")
+  try {
+    const first = freshLedger()
+    const second = freshLedger()
+    must(first, { op: "create", task: "первый независимый writer" })
+    must(second, { op: "create", task: "второй независимый writer" })
+    second.tasks[0].id = "T2" // изолируем проблему слияния от отдельной гонки аллокатора ID
+
+    saveLedger(file, first)
+    saveLedger(file, second)
+
+    const saved = loadLedger(file)
+    assert.deepEqual(saved.tasks.map((task) => task.id).sort(), ["T1", "T2"], "первый writer не теряет запись второго")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("P0-A: параллельные процессы создают уникальные task/agent ID и не теряют записи", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dev-console-id-reservation-"))
+  const file = join(dir, "state.json")
+  try {
+    const base = freshLedger()
+    must(base, { op: "create", task: "последний существующий ID" })
+    base.tasks[0].id = "T40"
+    beginAgent(base, { input: { agent: "general", description: "последний агент" }, ref: "ses_previous" }).id = "A20"
+    saveLedger(file, base)
+
+    const stateUrl = new URL("./state.ts", import.meta.url).href
+    const script = `
+      import { loadLedger, applyOp, beginAgent, saveLedger } from ${JSON.stringify(stateUrl)};
+      const file = ${JSON.stringify(file)};
+      const ledger = loadLedger(file);
+      const task = applyOp(ledger, { op: "create", task: "parallel child task", owner: "dev" }, { idFile: file });
+      if (!task.ok) throw new Error(task.error);
+      const agent = beginAgent(ledger, { input: { agent: "general", description: "parallel child agent" }, ref: "call_" + process.pid, idFile: file });
+      saveLedger(file, ledger);
+      console.log(JSON.stringify({ task: task.task.id, agent: agent.id }));
+    `
+    const launches = Array.from({ length: 8 }, () => new Promise<{ task: string; agent: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] })
+      let stdout = ""
+      let stderr = ""
+      child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk })
+      child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk })
+      child.on("error", reject)
+      child.on("close", (code) => {
+        if (code !== 0) return reject(new Error(`allocator child exit ${code}: ${stderr}`))
+        try { resolve(JSON.parse(stdout.trim())) } catch (error) { reject(new Error(`bad allocator child output: ${stdout} (${String(error)})`)) }
+      })
+    }))
+    const results = await Promise.all(launches)
+    const taskIds = results.map((row) => row.task)
+    const agentIds = results.map((row) => row.agent)
+    assert.equal(new Set(taskIds).size, 8, `task IDs are unique: ${taskIds.join(", ")}`)
+    assert.equal(new Set(agentIds).size, 8, `agent IDs are unique: ${agentIds.join(", ")}`)
+    assert.deepEqual(taskIds.map((id) => Number(id.slice(1))).sort((a, b) => a - b), [41, 42, 43, 44, 45, 46, 47, 48])
+    assert.deepEqual(agentIds.map((id) => Number(id.slice(1))).sort((a, b) => a - b), [21, 22, 23, 24, 25, 26, 27, 28])
+
+    const saved = loadLedger(file)
+    assert.equal(saved.tasks.filter((task) => task.task === "parallel child task").length, 8, "all task rows survived independent saves")
+    assert.equal(saved.agents.filter((agent) => agent.session_ref?.startsWith("call_")).length, 8, "all agent rows survived independent saves")
+    assert.ok(existsSync(`${file}.ids.json`), "durable reservation sidecar created")
+    assert.equal(existsSync(`${file}.ids.json.lock`), false, "allocator lock released")
+    assert.equal(existsSync(`${file}.lock`), false, "ledger lock released")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("P0-A: ID allocator seeds from backup after primary ledger corruption", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dev-console-id-backup-"))
+  const file = join(dir, "state.json")
+  try {
+    writeFileSync(file, "{ broken primary", "utf8")
+    writeFileSync(`${file}.bak`, JSON.stringify({ tasks: [{ id: "T70" }], agents: [{ id: "A30" }] }), "utf8")
+    assert.equal(reserveLedgerId(file, "task"), "T71")
+    assert.equal(reserveLedgerId(file, "agent"), "A31")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("P0-A: corrupted ID sidecar fails closed instead of reissuing a reservation", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dev-console-id-corrupt-"))
+  const file = join(dir, "state.json")
+  try {
+    writeFileSync(`${file}.ids.json`, "{ broken allocator", "utf8")
+    assert.throws(() => reserveLedgerId(file, "task", [{ id: "T99" }]), /allocator is corrupt/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("P0-A: runtime ID options keep task and agent creation on the durable allocator", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dev-console-id-runtime-"))
+  const file = join(dir, "state.json")
+  try {
+    const l = freshLedger()
+    const one = applyOp(l, { op: "create", task: "через runtime" }, { idFile: file })
+    assert.equal(one.ok, true)
+    assert.equal(one.ok ? one.task.id : "", "T1")
+    const agent = beginAgent(l, { input: { agent: "general" }, idFile: file })
+    assert.equal(agent.id, "A1")
+    const stale = freshLedger()
+    const two = applyOp(stale, { op: "create", task: "второй snapshot" }, { idFile: file })
+    assert.equal(two.ok ? two.task.id : "", "T2", "stale in-memory state cannot reissue T1")
+    const secondAgent = beginAgent(stale, { input: { agent: "general" }, idFile: file })
+    assert.equal(secondAgent.id, "A2", "agent counter is independent and monotonic")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("P0-B: независимые model increments суммируются по baseline ровно один раз", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dev-console-model-merge-"))
+  const file = join(dir, "state.json")
+  const model = "opencode/glm-5.3-flash-free"
+  const cls = "dev:small" as const
+  try {
+    const seed = freshLedger()
+    seed.models = [{ model, ok: 10, fail: 2, upstream_fails: 4, upstream_streak: 3, cooldown_until: null,
+      byClass: { [cls]: { ok: 5, fail: 1, editsPerSecSum: 2, runs: 6 } } as never }]
+    saveLedger(file, seed)
+
+    const first = loadLedger(file)
+    const second = loadLedger(file)
+    recordModelResultByClass(first, model, cls, true, 0.5)
+    recordModelResultByClass(second, model, cls, true, 0.5)
+    saveLedger(file, first)
+    saveLedger(file, second)
+
+    let stat = modelStats(loadLedger(file)).find((row) => row.model === model)!
+    assert.equal(stat.ok, 12, "оба независимых ok учитываются")
+    assert.deepEqual(stat.byClass?.[cls], { ok: 7, fail: 1, editsPerSecSum: 3, runs: 8 })
+    assert.equal(stat.fail, 2, "неизменённый fail сохраняется")
+    assert.equal(stat.upstream_fails, 4, "неизменённый upstream counter сохраняется")
+
+    saveLedger(file, second)
+    stat = modelStats(loadLedger(file)).find((row) => row.model === model)!
+    assert.equal(stat.ok, 12, "повторное сохранение того же снимка не задваивает delta")
+    assert.equal(stat.byClass?.[cls].runs, 8)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("P0-B: новые model rows из пустого baseline складывают оба независимых результата", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dev-console-model-empty-baseline-"))
+  const file = join(dir, "state.json")
+  const model = "opencode/glm-5.3-flash-free"
+  const cls = "dev:small" as const
+  try {
+    saveLedger(file, freshLedger())
+    const first = loadLedger(file)
+    const second = loadLedger(file)
+    recordModelResultByClass(first, model, cls, true, 0.25)
+    recordModelResultByClass(second, model, cls, true, 0.5)
+    saveLedger(file, first)
+    saveLedger(file, second)
+    const stat = modelStats(loadLedger(file)).find((row) => row.model === model)!
+    assert.equal(stat.ok, 2, "both writers created a new row, so both increments survive")
+    assert.deepEqual(stat.byClass?.[cls], { ok: 2, fail: 0, editsPerSecSum: 0.75, runs: 2 })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("P0-B: per-class recording does not double-count global totals when lifecycle already recorded them", () => {
+  const model = "opencode/glm-5.3-flash-free"
+  const cls = "dev:small" as const
+  const l = freshLedger()
+  recordModelResult(l, model, true)
+  recordModelResultByClass(l, model, cls, true, 0.5, undefined, false)
+  let stat = modelStats(l).find((row) => row.model === model)!
+  assert.equal(stat.ok, 1, "one completed agent is one global success")
+  assert.deepEqual(stat.byClass?.[cls], { ok: 1, fail: 0, editsPerSecSum: 0.5, runs: 1 })
+
+  const failed = freshLedger()
+  recordModelResult(failed, model, false, "upstream")
+  recordModelResultByClass(failed, model, cls, false, 0.1, "upstream", false)
+  stat = modelStats(failed).find((row) => row.model === model)!
+  assert.equal(stat.upstream_fails, 1, "one endpoint failure is one global upstream failure")
+  assert.equal(stat.byClass?.[cls].runs, 1, "the per-class run is still retained")
+  assert.equal(stat.byClass?.[cls].fail, 0, "upstream does not poison model fail-rate")
+})
+
+test("P0-B: явный reset upstream-стрика и cooldown побеждает старый writer", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dev-console-model-reset-"))
+  const file = join(dir, "state.json")
+  const model = "opencode/glm-5.3-flash-free"
+  try {
+    const seed = freshLedger()
+    seed.models = [{ model, ok: 4, fail: 0, upstream_fails: 3, upstream_streak: 4,
+      cooldown_until: new Date(Date.now() + 60_000).toISOString(),
+      upstream_streak_reset_at: "2026-11-01T00:00:00.000Z",
+      upstream_streak_updated_at: "2026-11-01T00:00:00.000Z",
+      cooldown_updated_at: "2026-11-01T00:00:00.000Z" }]
+    saveLedger(file, seed)
+
+    const stale = loadLedger(file)
+    const reset = loadLedger(file)
+    bumpUpstreamCooldown(stale, model, 10_000, Date.now() - 5_000)
+    resetModelCooldowns(reset)
+    saveLedger(file, reset)
+    saveLedger(file, stale)
+
+    const stat = modelStats(loadLedger(file)).find((row) => row.model === model)!
+    assert.equal(stat.upstream_streak, 0, "pre-reset stale increment is discarded")
+    assert.equal(stat.cooldown_until, null, "pre-reset stale cooldown is not restored")
+    assert.ok(stat.upstream_streak_reset_at && Date.parse(stat.upstream_streak_reset_at) > Date.parse("2026-11-01T00:00:00.000Z"))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("P0-C: tombstone не даёт stale snapshot воскресить удалённого агента", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dev-console-agent-tombstone-"))
+  const file = join(dir, "state.json")
+  try {
+    const base = freshLedger()
+    beginAgent(base, { input: { agent: "general", description: "spawn call record" }, ref: "call_1" })
+    beginAgent(base, { input: { agent: "general", description: "child session record" }, ref: "ses_child" })
+    saveLedger(file, base)
+
+    const stale = loadLedger(file)
+    const current = loadLedger(file)
+    const removedId = current.agents.find((agent) => agent.session_ref === "ses_child")!.id
+    assert.ok(rekeyAgent(current, "call_1", "ses_child"), "rekey absorbs duplicate record")
+    assert.ok(current.tombstones?.agents?.[removedId], "removed duplicate receives durable tombstone")
+    saveLedger(file, current)
+    saveLedger(file, stale)
+
+    const saved = loadLedger(file)
+    assert.ok(!saved.agents.some((agent) => agent.id === removedId), "stale writer cannot resurrect removed agent")
+    assert.ok(saved.tombstones?.agents?.[removedId], "tombstone survives roundtrip")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("P0-C: tombstone скрывает сущность даже если старый файл содержит и строку, и маркер удаления", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dev-console-tombstone-read-"))
+  const file = join(dir, "state.json")
+  try {
+    const l = freshLedger()
+    const removed = beginAgent(l, { input: { agent: "general" }, ref: "call_deleted" })
+    l.tombstones = { agents: { [removed.id]: new Date().toISOString() } }
+    saveLedger(file, l)
+    const loaded = loadLedger(file)
+    assert.ok(!loaded.agents.some((agent) => agent.id === removed.id), "read normalization obeys tombstone before projection")
+    assert.ok(loaded.tombstones?.agents?.[removed.id], "deletion marker remains durable")
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -3598,8 +3910,11 @@ test("T66: «был рейт лимит, перезапусти» — сброс
   setModelCooldown(l, DEMON_MODEL, COOLDOWN_MS, 1000)
   setModelCooldown(l, NEMOTRON_MODEL, COOLDOWN_MS, 1000)
   setModelCooldown(l, INSTANCE_MODEL, COOLDOWN_MS, 1000)
+  bumpUpstreamCooldown(l, DEMON_MODEL, COOLDOWN_MS, 1000)
+  assert.ok((modelStats(l).find((s) => s.model === DEMON_MODEL)?.upstream_streak ?? 0) > 0, "upstream-серия накоплена до сброса")
 
   assert.equal(resetModelCooldowns(l), 3, "все три кулдауна сняты")
+  assert.equal(modelStats(l).find((s) => s.model === DEMON_MODEL)?.upstream_streak, 0, "явный reset обнуляет upstream-серию")
   assert.equal(chooseChildModel(l, null, 2000), DEMON_MODEL, "выбор вернулся к дефолту (звено 1 = GLM)")
   assert.equal(modelStats(l).find((s) => s.model === DEMON_MODEL)?.ok, 1, "статистика выжила")
   assert.equal(resetModelCooldowns(l), 0, "повторный сброс — no-op")
@@ -5068,7 +5383,7 @@ test("T33: parseSessionFeed — глобальный срез сервера →
   const kidsFeed = {
     data: [
       // дети СВЕЖИЕ: честное окно видимости describeChild (30 мин) их держит
-      { id: "ses_child1", parentID: "ses_tab1", title: "Трассировка канваса сигнала", model: { id: "glm-5.3-flash-free" }, location: { directory: root }, time: { updated: Date.now() - 45_000 } },
+      { id: "ses_child1", parentID: "ses_tab1", title: "Трассировка канваса сигнала", model: { id: "glm-5.3-flash-free" }, location: { directory: root }, time: { updated: Date.now() - 45_000 }, cost: 0.01, tokens: { input: 100, output: 20, reasoning: 5, cache: { read: 10, write: 2 } } },
       { id: "ses_child2", parentID: "ses_tab1", title: "T159 · cold-load", model: { id: "mimo-v2.6-flash-free" }, location: { directory: root }, time: { updated: Date.now() - 45_000 } },
       { id: "ses_tab1", title: "FIELD · Мара", location: { directory: root }, time: { updated: Date.now() - 45_000 } },
       { id: "ses_child3", parentID: "ses_tab1", title: "", location: { directory: root }, time: { updated: Date.now() - 45_000 } },
@@ -5089,6 +5404,7 @@ test("T33: parseSessionFeed — глобальный срез сервера →
   const ws = project(l).ui
   assert.ok(ws.includes("Трассировка канваса сигнала"), "строка субагента в панели")
   assert.ok(ws.includes("▸ "), "строка-бот с маркером ▸")
+  assert.ok(ws.includes("TOK 137"), "read-only child row shows its own session usage from /api/session")
   const n2 = attachTabChildren(l, [])
   assert.equal(n2, 0, "пустой фид детей — строки не висят вечно")
   assert.equal(l.tabs[0].children, undefined, "мёртвые дети снимаются")
@@ -5848,9 +6164,9 @@ test("T130: гейт ловит потерянный экспорт (негат�
   assert.deepEqual(imps[0].names, ["a", "lost", "C"], "импорты разобраны (комментарии/типы отброшены)")
   assert.deepEqual(imps[0].names.filter((n) => !ex.has(n)), ["lost"], "потерянный экспорт найден — гейт не пропустит P0")
 })
-test("T130: index/state/cpu/personas/ritual/import_gate — импорты сходятся с экспортами", () => {
+test("T130: runtime modules/import_gate — импорты сходятся с экспортами", () => {
   const dir = fileURLToPath(new URL(".", import.meta.url))
-  for (const f of ["index.ts", "state.ts", "cpu.ts", "personas.ts", "ritual.ts", "import_gate.ts"]) {
+  for (const f of ["index.ts", "state.ts", "cpu.ts", "personas.ts", "ritual.ts", "server_guard.ts", "import_gate.ts"]) {
     assert.deepEqual(gapsIn(join(dir, f)), [], `${f}: потерянные импорты (см. import_gate.ts)`)
   }
 })
@@ -5925,7 +6241,8 @@ test("T125: эмодзи и мигание — только прямой чат;
 })
 // ------------------- T124: канал жалоб — дедуп, сброс аck, проекция -----
 import { addComplaint, acknowledgeComplaint, loadComplaints, saveComplaints, makeDedupKey, COMPLAINT_COMPONENTS, formatComplaintsSection } from "./state.ts"
-const cDir = ".devata-test-complaints"
+const cDir = mkdtempSync(join(tmpdir(), "devata-test-complaints-"))
+after(() => rmSync(cDir, { recursive: true, force: true }))
 function fresh(complaints: Complaint[]): void { saveComplaints(cDir, complaints) }
 test("T124: одна и та же жалоба не дублится в окне — обновится ts", () => {
   fresh({ complaints: [] })
@@ -6030,7 +6347,7 @@ import { undefinedUsesIn, calledNames, declaredNames } from "./import_gate.ts"
 test("T146: import-gate ловит вызов ЭКСПОРТА без импорта (ReferenceError в рантайме)", () => {
   const dir = mkdtempSync(join(tmpdir(), "gate-t146-"))
   try {
-    const stateSrc = readFileSync("C:/Users/banan/Developer/pipeline-setup/DEV_CONSOLE/state.ts", "utf8")
+    const stateSrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "state.ts"), "utf8")
     writeFileSync(join(dir, "state.ts"), stateSrc, "utf8")
     const bad = 'import { project } from "./state.ts"\nexport const go = (): string => {\n  const r = loadComplaints("C:/x")\n  return project({} as never).ui + r.length\n}\n'
     const badFile = join(dir, "bad.ts")
@@ -6115,7 +6432,7 @@ test("T152+: одиночная «В» перед разделителем (ос
 
 // ------------------- T149: каталог плагина чист (NUL/мусор ломают загрузку) ---
 test("T149: в каталоге плагина нет NUL-байтов и посторонних файлов — иначе плагин не грузится", () => {
-  const dir = "C:/Users/banan/Developer/pipeline-setup/DEV_CONSOLE"
+  const dir = dirname(fileURLToPath(import.meta.url))
   const files = readdirSync(dir)
   for (const f of files) {
     const p = join(dir, f)
@@ -6251,6 +6568,98 @@ test("T152: имя переживает save/load (sanitizeTab переноси�
     saveLedger(file, l)
     const back = loadLedger(file)
     assert.equal(back.tabs.find((t) => t.session_id === "ses_two")?.persona, before, "после roundtrip имя на месте")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+test("T240: agent observability — self-report, immutable plan ETA, cumulative usage, last tool, save/load", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dev-console-t240-"))
+  const file = join(dir, "state.json")
+  try {
+    const l = freshLedger()
+    const agent = beginAgent(l, { input: { agent: "general", description: "[T11] Проверить домены" }, ref: "ses_t240" })
+    const originalPlan = agent.eta_min
+    const at1 = "2026-11-17T09:00:00.000Z"
+    const reported = noteAgentProgress(l, "ses_t240", {
+      step: "проверяю цены .codes у 3 регистраторов\n",
+      done: "3/10",
+      next: "reg.ru API",
+      eta_remaining_min: 7,
+    }, at1)
+    assert.equal(reported?.progress?.step, "проверяю цены .codes у 3 регистраторов")
+    assert.equal(reported?.progress?.done, "3/10")
+    assert.equal(reported?.progress?.next, "reg.ru API")
+    assert.equal(reported?.progress?.eta_remaining_min, 7)
+    assert.equal(reported?.eta_min, originalPlan, "self-report must never overwrite the original plan")
+    const redacted = noteAgentProgress(l, "ses_t240", {
+      step: "GET https://registry.test/?api_key=sk-12345678901234567890",
+      done: "password=hunter2",
+      next: "Authorization: Bearer abc.def.ghi",
+    }, "2026-11-17T09:00:01.000Z")
+    assert.doesNotMatch(redacted?.progress?.step ?? "", /sk-1234567890/)
+    assert.match(redacted?.progress?.step ?? "", /api_key=\[redacted\]/)
+    assert.doesNotMatch(redacted?.progress?.done ?? "", /hunter2/)
+    assert.doesNotMatch(redacted?.progress?.next ?? "", /abc\.def\.ghi/)
+    noteAgentProgress(l, "ses_t240", { step: "проверяю цены .codes у 3 регистраторов", done: "3/10", next: "reg.ru API", eta_remaining_min: 7 }, at1)
+    assert.throws(() => noteAgentProgress(l, "ses_t240", { step: "  ", eta_remaining_min: 7 }), /step is required/)
+    assert.throws(() => noteAgentProgress(l, "ses_t240", { step: "valid", eta_remaining_min: 1441 }), /between 0 and 1440/)
+
+    noteAgentUsage(l, "ses_t240", {
+      cost: 0.02,
+      tokens: { input: 100, output: 20, reasoning: 10, cache: { read: 4, write: 1 } },
+    }, at1, "usage-event")
+    assert.equal(agent.usage?.total_tokens, 135)
+    assert.equal(agent.usage?.source, "usage-event")
+    noteAgentUsage(l, "ses_t240", {
+      cost: 0.03,
+      tokens: { total: 199, input: 150, output: 30, reasoning: 12, cache: { read: 5, write: 2 } },
+    }, "2026-11-17T09:01:00.000Z", "session-snapshot")
+    assert.equal(agent.usage?.total_tokens, 199, "cumulative snapshots replace previous totals, never sum")
+    assert.equal(agent.usage?.cost_usd, 0.03)
+
+    noteAgentTool(l, "ses_t240", "read", "DEV_CONSOLE/state.ts", "2026-11-17T09:01:30.000Z", "call-1")
+    assert.equal(agent.last_tool?.name, "read")
+    assert.equal(agent.last_tool?.target, "DEV_CONSOLE/state.ts")
+    assert.equal(agent.last_tool?.call_id, "call-1")
+    noteAgentTool(l, "ses_t240", "old-tool", "stale", "2026-11-17T09:00:30.000Z", "call-old")
+    assert.equal(agent.last_tool?.name, "read", "out-of-order tool events must not roll state back")
+    assert.equal(noteAgentTool(l, "ses_t240", "read", "DEV_CONSOLE/state.ts", "2026-11-17T09:01:30.000Z", "call-1"), null, "duplicate replay is ignored")
+    assert.ok(noteAgentRequest(l, "ses_t240", "msg-1"), "assistant completion is counted")
+    assert.equal(noteAgentRequest(l, "ses_t240", "msg-1"), null, "durable message replay is deduplicated")
+    assert.ok(noteAgentRequest(l, "ses_t240", "msg-2"), "next assistant response increments the count")
+    assert.equal(agent.request_count, 2)
+
+    const childLedger = freshLedger()
+    const childAgent = beginAgent(childLedger, { input: { agent: "general", description: "[T11] Проверка API snapshot" }, ref: "ses_feed" })
+    upsertTab(childLedger, { session_id: "ses_parent", title: "Parent" })
+    const childFeed = parseChildFeed({ data: [{
+      id: "ses_feed", parentID: "ses_parent", title: "T11 · проверка",
+      location: { directory: "/repo" }, model: { id: "glm-5.3-flash" },
+      time: { updated: Date.parse(at1) }, cost: 0.04,
+      tokens: { input: 100, output: 20, reasoning: 10, cache: { read: 4, write: 1 } },
+    }] }, "/repo")
+    assert.equal(childFeed[0]?.usage?.total_tokens, 135, "GET /api/session usage is parsed per child")
+    attachTabChildren(childLedger, childFeed)
+    assert.equal(childAgent.usage?.cost_usd, 0.04, "child feed snapshot reaches its Agent record")
+
+    const rendered = project(l).ui
+    assert.ok(rendered.includes("проверяю цены .codes"), "panel projection shows self-reported step")
+    assert.ok(rendered.includes("3/10"), "panel projection shows self-reported checkpoint")
+    assert.ok(rendered.includes("ETA≈7м"), "panel projection marks ETA as a report")
+    assert.ok(rendered.includes("TOK 199"), "panel projection shows per-agent usage")
+    assert.ok(rendered.includes("tool: read"), "panel projection shows last observed tool")
+    assert.ok(rendered.includes("REQ 2"), "panel projection shows completed model replies for this agent")
+
+    saveLedger(file, l)
+    const back = loadLedger(file)
+    const saved = back.agents.find((a) => a.session_ref === "ses_t240")
+    assert.equal(saved?.progress?.done, "3/10", "progress survives ledger roundtrip")
+    assert.equal(saved?.usage?.total_tokens, 199, "usage survives ledger roundtrip")
+    assert.equal(saved?.last_tool?.call_id, "call-1", "last tool survives ledger roundtrip")
+    assert.equal(saved?.request_count, 2, "per-agent request count survives ledger roundtrip")
+    noteAgentTool(l, "ses_t240", "fetch", "https://example.test/?access_token=secret-value", "2026-11-17T09:02:00.000Z", "call-2")
+    assert.doesNotMatch(agent.last_tool?.target ?? "", /secret-value/)
+    assert.deepEqual(saved?.request_ids, ["msg-1", "msg-2"], "request dedupe ring survives ledger roundtrip")
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

@@ -4,5 +4,10 @@
   },
   "devDependencies": {
     "asar": "^3.2.0"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test DEV_CONSOLE/activity.test.ts DEV_CONSOLE/experience.test.ts DEV_CONSOLE/ritual.test.ts DEV_CONSOLE/server_guard.test.ts DEV_CONSOLE/state.test.ts",
+    "gate": "node --experimental-strip-types DEV_CONSOLE/import_gate.ts",
+    "check": "npm run test && npm run gate"
   }
 }
