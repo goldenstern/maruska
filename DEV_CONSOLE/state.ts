@@ -5524,12 +5524,12 @@ export const renderConsoleHtml = (
   const head = [loc?.name, loc?.path, loc?.branch, loc?.remote]
     .map((x) => (typeof x === "string" ? x.trim() : ""))
     .filter((x) => x !== "")
-  // T164 (заказ Основателя 15.11): кнопка «⏻ мониторы» живёт В ОДНОЙ СТРОКЕ с
+  // T164 (заказ Основателя 15.11): кнопка «🔌 мониторы» живёт В ОДНОЙ СТРОКЕ с
   // шапкой панели (раньше была отдельной строкой после блок-div «📁 …»).
   // Семантика T138-кнопки отменена заказом: гасим ЭКРАНЫ (спящий режим
   // дисплеев), CPU-мониторы живут. Без шапки — кнопка своей строкой.
   const moBtn =
-    `<button id="moBtn" title="T164: погасить экраны как при спящем режиме (свет можно выключить); CPU-мониторы живут" style="padding:2px 10px; font-size:12px; cursor:pointer; background:#161b22; color:#ffa657; border:1px solid #30363d; border-radius:6px; white-space:nowrap;">⏻ мониторы</button>`
+    `<button id="moBtn" title="T164: погасить экраны как при спящем режиме (свет можно выключить); CPU-мониторы живут" style="padding:2px 10px; font-size:12px; cursor:pointer; background:#161b22; color:#ffa657; border:1px solid #30363d; border-radius:6px; white-space:nowrap;">🔌 мониторы</button>`
   const locLine =
     head.length > 0
       ? `<div id="loc" style="display:flex; align-items:center; gap:10px; max-width:80%;">${moBtn}<span style="overflow-wrap:anywhere;">📁 ${head.map(esc).join(" · ")}</span></div>\n`
@@ -5871,7 +5871,7 @@ if (CH && typeof fetch === "function") {
     document.getElementById("ts")?.appendChild(hint);
   }
 }
-// T164 (заказ Основателя 15.11): кнопка «⏻ мониторы» → POST /monitors-off —
+// T164 (заказ Основателя 15.11): кнопка «🔌 мониторы» → POST /monitors-off —
 // гасит ЭКРАНЫ (спящий режим дисплеев). Кнопка многоразовая: после пробуждения
 // экраны можно гасить снова (авто-обновление и так вернёт текст).
 const moBtn = document.getElementById("moBtn");
@@ -5879,15 +5879,15 @@ if (moBtn && CH && typeof moBtn.addEventListener === "function") {
   moBtn.addEventListener("click", function () {
     const ac2 = typeof AbortController !== "undefined" ? new AbortController() : null;
     const t2 = ac2 ? setTimeout(function () { ac2.abort(); }, 4000) : null;
-    moBtn.textContent = "⏻ гашу…";
+    moBtn.textContent = "🔌 гашу…";
     fetch(CH + "/monitors-off", { method: "POST", signal: ac2 ? ac2.signal : undefined })
       .then(function (r) { if (t2) clearTimeout(t2); if (!r.ok) throw r.status; return r.json(); })
       .then(function () {
-        moBtn.textContent = "⏻ погасились ✓";
+        moBtn.textContent = "🔌 погасились ✓";
         chSay("экраны погашены (CPU-мониторы живут)", true);
-        setTimeout(function () { moBtn.textContent = "⏻ мониторы"; }, 3000);
+        setTimeout(function () { moBtn.textContent = "🔌 мониторы"; }, 3000);
       })
-      .catch(function () { if (t2) clearTimeout(t2); moBtn.textContent = "⏻ мониторы"; chSay("экраны: канал недоступен", false); });
+      .catch(function () { if (t2) clearTimeout(t2); moBtn.textContent = "🔌 мониторы"; chSay("экраны: канал недоступен", false); });
   });
 }
 // T62: foreign sessions collapsible + blink
