@@ -1091,12 +1091,23 @@ export default Plugin.define({
         // посылка в окно РАБОЧЕГО СТОЛА. Проба 17.11 (Основатель подтвердил «погасли»):
         // FindWindow("Progman") → SendMessageTimeout(WM_SYSCOMMAND, SC_MONITORPOWER=2,
         // SMTO_ABORTIFHUNG, 5с) ×3 с паузой 700мс + дубль в WorkerW. Фикс = v2.
+        // T193: инлайн `-Command` хрупок (экранирование, canon: ps1 звать -File) и
+        // тихо падает (stdio ignore не показывает ошибки PS). Скрипт —
+        // коммиченный ресурс DEV_CONSOLE/scripts/monitors_off.ps1 (v2:
+        // Progman ×3 + WorkerW). Отсутствие файла = честный 500, не «ok».
         try {
-          const script =
-            "Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern IntPtr FindWindow(string cls, string title); [DllImport(\"user32.dll\")] public static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, IntPtr l, uint f, uint t, out IntPtr r);' -Name W2 -Namespace M2; " +
-            "$r=[IntPtr]::Zero; $pm=[M2.W2]::FindWindow('Progman',$null); 1..3 | ForEach-Object { [M2.W2]::SendMessageTimeout($pm, 0x0112, [IntPtr]0xf170, [IntPtr]2, 2, 5000, [ref]$r) | Out-Null; Start-Sleep -Milliseconds 700 }; " +
-            "$ww=[M2.W2]::FindWindow('WorkerW',$null); if ($ww -ne [IntPtr]::Zero) { [M2.W2]::SendMessageTimeout($ww, 0x0112, [IntPtr]0xf170, [IntPtr]2, 2, 5000, [ref]$r) | Out-Null }"
-          const child = spawn("powershell", ["-NoProfile", "-Command", script], {
+          const monitorsScript = (() => {
+            try {
+              return join(dirname(realpathSync(fileURLToPath(import.meta.url))), "scripts", "monitors_off.ps1")
+            } catch {
+              return join(root, "DEV_CONSOLE", "scripts", "monitors_off.ps1")
+            }
+          })()
+          if (!existsSync(monitorsScript)) {
+            reply(res, 500, { ok: false, error: `monitors_off.ps1 не найден: ${monitorsScript}` })
+            return
+          }
+          const child = spawn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", monitorsScript], {
             detached: true,
             stdio: "ignore",
             windowsHide: true,
@@ -2457,14 +2468,37 @@ export default Plugin.define({
             reason: `задача ${task.id} в ${task.state} — диспатч запрещён (ретрай не может перебить блок)`,
           }
         }
-        const capCut = Date.now() - 60 * 60_000
-        const recentFails = pre.agents.filter(
-          (a) => a.task_id === task.id && a.state === "failed" && Date.parse(a.updated_at) >= capCut,
+        // T193 (шторм 17.11: 17 спавнов за 38 мин на мёртвом upstream): старая
+        // капа (T132) считала только ОФОРМЛЕННЫЕ смерти (state=failed), а дети,
+        // умершие молча (сессия создана, исполнения нет, settle-события нет),
+        // капу не будили → спавнь хоть 17 раз. Новая капа — на ПОПЫТКИ: все
+        // записи агентов задачи за час, любое состояние. ≥5 попыток или ≥3
+        // оформленных смертей → skip И задача авто-BLOCKED (T170-гард держит
+        // её от респавнов до ручного разбора; повторные DOING-флипы модели
+        // капу переживают — спавн всё равно не пройдёт).
+        const cut1h = Date.now() - 60 * 60_000
+        const attempts1h = pre.agents.filter(
+          (a) => a.task_id === task.id && Date.parse(a.updated_at) >= cut1h,
         ).length
-        if (recentFails >= 3) {
+        const recentFails = pre.agents.filter(
+          (a) => a.task_id === task.id && a.state === "failed" && Date.parse(a.updated_at) >= cut1h,
+        ).length
+        if (recentFails >= 3 || attempts1h >= 5) {
+          try {
+            const l = loadLedger(stateFile)
+            const t = l.tasks.find((x) => x.id === task.id)
+            if (t && t.state !== "BLOCKED" && t.state !== "GATE" && t.state !== "DONE") {
+              t.state = "BLOCKED"
+              t.why = `ретрай-кап (T193): ${attempts1h} попыток / ${recentFails} смертей за час — авто-блок до разбора; снять может Основатель или оркестратор`
+              save(l)
+              console.log(`[dev-console] T193: ${task.id} авто-BLOCKED (${attempts1h} попыток / ${recentFails} смертей за час)`)
+            }
+          } catch {
+            /* ledger busy — skip сработает и без блока, капа пересчитается */
+          }
           return {
             status: "skipped",
-            reason: `retry-cap: ${recentFails} падений за час — нужен диагноз, а не респавн (T132-инцидент)`,
+            reason: `retry-cap (T193): ${attempts1h} попыток / ${recentFails} смертей за час — задача авто-BLOCKED до разбора`,
           }
         }
 

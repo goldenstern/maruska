@@ -82,6 +82,7 @@ Do directly: triage, reading, routing, small known-solution edits, integration, 
 * This thread orchestrates: triage, recording, coordination, verification. Default executor of substantive work = a subagent.
 * Spawn descriptions start with `[T#]` — the runtime binds agent → task.
 * Dispatch is mechanical: DOING + `owner` (sent with `set_state`/`update`) → the runtime spawns in that same call — `dispatched` lands in the same response, nothing to wait for; `dispatch: skipped|failed` explains a miss. Never spawn manually; no owner = inline.
+* Ретрай-дисциплина (T193, шторм 17.11): каждый ретрай диспатча = реальный спавн (токены, CPU). На `[upstream]`/мёртвых детях руками — не более 2 повторов; упёрся — докладывай Основателю и оставь задачу. Капа диспатча сама уводит задачу в авто-BLOCKED при исчерпании (≥5 попыток/≥3 смертей за час) — блок снимает только разбор, не ретрай.
 * `READ = shared, WRITE = exclusive`: no two agents on the same file without coordination. Agent count ∝ real independent work; don't create agents to create agents.
 * Every subagent gets self-contained context, a concrete task, expected output; results stay short.
 

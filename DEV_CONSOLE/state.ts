@@ -5336,9 +5336,21 @@ export function project(
       rows.push(...describeTab(v, ledger, active))
       // T170: субагенты-дети сессий (read-only проекция фида) — строки-боты
       // сразу под вкладкой, до записей Agent (демонов).
-      for (const ch of v.children ?? []) {
-        const row = describeChild(ch)
-        if (row) rows.push(row)
+      // T193 (шторм 17.11: 17 одинаковых «простаивает»): дети схлопываются.
+      // Живые («работает ⏱») — построчно всегда; спящие — 2 последние,
+      // остальное одной сводной строкой «▸ ×N спящих · <таск>».
+      {
+        const kidRows = (v.children ?? [])
+          .map((ch) => ({ ch, row: describeChild(ch) }))
+          .filter((x): x is { ch: ChildFeedItem; row: string } => x.row !== null)
+        const liveKids = kidRows.filter((x) => x.row.includes("работает ⏱"))
+        const idleKids = kidRows.filter((x) => !x.row.includes("работает ⏱"))
+        for (const x of liveKids) rows.push(x.row)
+        for (const x of idleKids.slice(0, 2)) rows.push(x.row)
+        if (idleKids.length > 2) {
+          const what = idleKids[0].ch.title ? clip(idleKids[0].ch.title, AGENT_WHAT_CHARS) : "дети"
+          rows.push(`${DAEMON_INDENT}▸ ×${idleKids.length - 2} спящих · ${what}`)
+        }
       }
       for (const id of v.agents) {
         const a = ledger.agents.find((x) => x.id === id)
