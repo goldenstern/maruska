@@ -5337,19 +5337,28 @@ export function project(
       // T170: субагенты-дети сессий (read-only проекция фида) — строки-боты
       // сразу под вкладкой, до записей Agent (демонов).
       // T193 (шторм 17.11: 17 одинаковых «простаивает»): дети схлопываются.
-      // Живые («работает ⏱») — построчно всегда; спящие — 2 последние,
-      // остальное одной сводной строкой «▸ ×N спящих · <таск>».
+      // T195 (жалоба Основателя: «это просто тухлая штука» — мёртвые дети без
+      // записи агента рендерились построчно): живые («работает ⏱») и свежо
+      // уснувшие (≤2 мин) — построчно; спящие старше 2 мин — ТОЛЬКО сводной
+      // строкой «▸ ×N спящих · <таск>», постолбцовой простыни нет вовсе.
       {
+        const now = Date.now()
         const kidRows = (v.children ?? [])
-          .map((ch) => ({ ch, row: describeChild(ch) }))
+          .map((ch) => ({ ch, row: describeChild(ch, now) }))
           .filter((x): x is { ch: ChildFeedItem; row: string } => x.row !== null)
-        const liveKids = kidRows.filter((x) => x.row.includes("работает ⏱"))
-        const idleKids = kidRows.filter((x) => !x.row.includes("работает ⏱"))
-        for (const x of liveKids) rows.push(x.row)
-        for (const x of idleKids.slice(0, 2)) rows.push(x.row)
-        if (idleKids.length > 2) {
-          const what = idleKids[0].ch.title ? clip(idleKids[0].ch.title, AGENT_WHAT_CHARS) : "дети"
-          rows.push(`${DAEMON_INDENT}▸ ×${idleKids.length - 2} спящих · ${what}`)
+        const idleStale: { ch: ChildFeedItem; row: string }[] = []
+        for (const x of kidRows) {
+          if (x.row.includes("работает ⏱")) {
+            rows.push(x.row)
+            continue
+          }
+          const upd = Date.parse(x.ch.updated)
+          if (Number.isFinite(upd) && now - upd <= 120_000) rows.push(x.row)
+          else idleStale.push(x)
+        }
+        if (idleStale.length > 0) {
+          const what = idleStale[0].ch.title ? clip(idleStale[0].ch.title, AGENT_WHAT_CHARS) : "дети"
+          rows.push(`${DAEMON_INDENT}▸ ×${idleStale.length} спящих · ${what}`)
         }
       }
       for (const id of v.agents) {

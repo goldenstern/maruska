@@ -20,6 +20,43 @@ import {
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { ServerGuard, SERVER_REGISTRY_FILE, spawnDetached, type ServerRegistry } from "./server_guard.ts"
 import { basename, dirname, join } from "node:path"
+
+// T195 (заказ Основателя 17.11 «чтобы при гашении не вылазило окно консоли»):
+// гашение экранов нативным FFI-вызовом user32 ПРЯМО из рантайма (bun:ffi) —
+// ни дочернего процесса, ни мигающего cmd/powershell-окна (spawnDetached даже
+// с windowsHide мигал). В node-рантайме (тесты/другие хосты) bun:ffi нет —
+// динамический import не удаётся, фолбэк на spawnDetached (T194, ps1-ресурс).
+type ScreensOffFfi = () => string | null
+let screensOffFfi: ScreensOffFfi | null | undefined // undefined = ещё не пробовали, null = рантайм не bun
+
+function buildScreensOffFfi(bunffi: {
+  dlopen: (p: string, symbols: Record<string, { args: string[]; returns: string }>) => {
+    symbols: Record<string, (...args: unknown[]) => unknown>
+  }
+  FFIType: Record<string, string>
+  ptr: (v: unknown) => unknown
+}): ScreensOffFfi {
+  const F = bunffi.FFIType
+  const user32 = bunffi.dlopen("user32.dll", {
+    FindWindowA: { args: [F.cstring, F.cstring], returns: F.pointer },
+    SendMessageTimeoutA: { args: [F.pointer, F.u32, F.u64, F.u64, F.u32, F.u32, F.ptr], returns: F.pointer },
+  }).symbols
+  const SMTO_ABORTIFHUNG = 0x0002
+  const WM_SYSCOMMAND = 0x0112
+  const SC_MONITORPOWER = 0xf170
+  return () => {
+    const progman = user32.FindWindowA("Progman", null)
+    if (!progman) return "Progman не найден"
+    const outPtr = bunffi.ptr(new Uint32Array(1))
+    let sent = 0
+    for (let i = 0; i < 3; i++) {
+      if (user32.SendMessageTimeoutA(progman, WM_SYSCOMMAND, SC_MONITORPOWER, 2, SMTO_ABORTIFHUNG, 5000, outPtr)) sent++
+    }
+    const workerW = user32.FindWindowA("WorkerW", null)
+    if (workerW && user32.SendMessageTimeoutA(workerW, WM_SYSCOMMAND, SC_MONITORPOWER, 2, SMTO_ABORTIFHUNG, 5000, outPtr)) sent++
+    return sent > 0 ? `ffi: ${sent}/4 импульсов` : "импульсы не прошли"
+  }
+}
 import {
   applyOp,
   autoBlinkAction,
@@ -1095,37 +1132,62 @@ export default Plugin.define({
         // тихо падает (stdio ignore не показывает ошибки PS). Скрипт —
         // коммиченный ресурс DEV_CONSOLE/scripts/monitors_off.ps1 (v2:
         // Progman ×3 + WorkerW). Отсутствие файла = честный 500, не «ok».
-        try {
-          const monitorsScript = (() => {
-            try {
-              return join(dirname(realpathSync(fileURLToPath(import.meta.url))), "scripts", "monitors_off.ps1")
-            } catch {
-              return join(root, "DEV_CONSOLE", "scripts", "monitors_off.ps1")
+        // T195: порядок — сначала нативный FFI (без окна консоли), ps1-спавн
+        // только как фолбэк для node-рантаймов.
+        void (async () => {
+          try {
+            if (screensOffFfi === undefined) {
+              try {
+                screensOffFfi = buildScreensOffFfi(await import("bun:ffi"))
+              } catch {
+                screensOffFfi = null // не bun-рантайм — фолбэк на спавн
+              }
             }
-          })()
-          if (!existsSync(monitorsScript)) {
-            reply(res, 500, { ok: false, error: `monitors_off.ps1 не найден: ${monitorsScript}` })
-            return
+            let how: string
+            let detail: string
+            if (screensOffFfi) {
+              const r = screensOffFfi()
+              if (r === null) {
+                reply(res, 500, { ok: false, error: "ffi-гашение не удалось" })
+                return
+              }
+              how = "ffi"
+              detail = r
+            } else {
+              const monitorsScript = (() => {
+                try {
+                  return join(dirname(realpathSync(fileURLToPath(import.meta.url))), "scripts", "monitors_off.ps1")
+                } catch {
+                  return join(root, "DEV_CONSOLE", "scripts", "monitors_off.ps1")
+                }
+              })()
+              if (!existsSync(monitorsScript)) {
+                reply(res, 500, { ok: false, error: `monitors_off.ps1 не найден: ${monitorsScript}` })
+                return
+              }
+              // T194 (17.11): прямой spawn("powershell", [...args], {detached}) в рантайме
+              // сервиса МОЛЧА не рождает процесс (замер: до POST 4 powershell, после 4;
+              // консоль логов плагина туда не пишется). Рабочий паттерн в этом же
+              // рантайме — spawnDetached (server_guard, T94): shell:true резолвит
+              // исполняемый сам, панель-сервер им поднят и жив. Моники идут через него.
+              const spawned = spawnDetached(
+                `powershell -NoProfile -ExecutionPolicy Bypass -File "${monitorsScript}"`,
+                dirname(monitorsScript),
+              )
+              if (!spawned) {
+                reply(res, 500, { ok: false, error: "spawnDetached вернул null — спавн не состоялся" })
+                return
+              }
+              how = "spawn"
+              detail = `pid ${spawned.pid}`
+            }
+            diag.screens_off = "off@" + new Date().toISOString()
+            console.log(`[dev-console] T195: экраны погашены кнопкой панели (${how}: ${detail})`)
+            reply(res, 200, { ok: true, screens: diag.screens_off, how, detail })
+          } catch (e) {
+            reply(res, 500, { ok: false, error: String(e) })
           }
-          // T194 (17.11): прямой spawn("powershell", [...args], {detached}) в рантайме
-          // сервиса МОЛЧА не рождает процесс (замер: до POST 4 powershell, после 4;
-          // консоль логов плагина туда не пишется). Рабочий паттерн в этом же
-          // рантайме — spawnDetached (server_guard, T94): shell:true резолвит
-          // исполняемый сам, панель-сервер им поднят и жив. Моники идут через него.
-          const spawned = spawnDetached(
-            `powershell -NoProfile -ExecutionPolicy Bypass -File "${monitorsScript}"`,
-            dirname(monitorsScript),
-          )
-          if (!spawned) {
-            reply(res, 500, { ok: false, error: "spawnDetached вернул null — спавн не состоялся" })
-            return
-          }
-          diag.screens_off = "off@" + new Date().toISOString()
-          console.log(`[dev-console] T192: экраны погашены кнопкой панели (pid ${spawned.pid}, Progman ×3 + WorkerW)`)
-          reply(res, 200, { ok: true, screens: diag.screens_off, pid: spawned.pid })
-        } catch (e) {
-          reply(res, 500, { ok: false, error: String(e) })
-        }
+        })()
         return
       }
       if (req.method !== "POST" || (path !== "/wake" && path !== "/blink" && path !== "/order")) {
