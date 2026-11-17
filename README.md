@@ -19,6 +19,13 @@
 
 Нужен [OpenCode](https://opencode.ai) 2.x (Node ≥ 20 / Bun).
 
+**Ленивый путь (корпоративный стандарт):** скопируй промпт из
+[docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md) в свежий сеанс OpenCode —
+он сам склонирует, подключит, проверит сьют, познакомится и откроет панель.
+От тебя — имя и слово «запускай».
+
+Ручной путь:
+
 ```bash
 git clone https://github.com/goldenstern/maruska.git
 cd maruska
