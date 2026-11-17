@@ -1083,19 +1083,19 @@ export default Plugin.define({
         // машины («чтобы можно было свет отключить»): SC_MONITORPOWER=2. T138-семантика
         // («погасить фоновые CPU-мониторы») ОТМЕНЕНА этим заказом: stopCpuBackground
         // НЕ зовём, сэмплинг живёт, diag.cpu_monitors не трогаем.
-        // T176 (жалоба Основателя 16.11 «Гашение мониторов не работает»): обычный
-        // SendMessage с HWND_BROADCAST развозит WM_SYSCOMMAND по ВСЕМ top-level
-        // окнам ПОСЛЕДОВАТЕЛЬНО и вязнет на зависших (у Основателя 4 висяка:
-        // CalculatorApp, Media.Player, PaintStudio, SystemSettings — qwinsta:
-        // консоль активна, RDP нет) — импульс гашения не доходит до системного
-        // DefWindowProc, экраны остаются включёнными. Фикс: SendMessageTimeout с
-        // SMTO_ABORTIFHUNG=0x2 (зависшие окна бросаются по таймауту 2с), повтор ×3
-        // с паузой 500мс (часть драйверов съедает первый импульс). Живая проба
-        // 16.11 18:46: SendMessageTimeout вернул 1 ×3 без зависаний.
+        // T176 (16.11): broadcast с SendMessageTimeout — проба 18:46 гасила.
+        // T192 (17.11): после ночного ребута broadcast ПЕРЕСТАЛ гасить при тех же
+        // 4 зависших окнах (CalculatorApp, Media.Player, PaintStudio, SystemSettings) —
+        // SendMessageTimeout возвращал 1 ×3, экраны стояли. Причина: рассылка по
+        // HWND_BROADCAST зависит от очереди сообщений чужих окон; надёжнее адресная
+        // посылка в окно РАБОЧЕГО СТОЛА. Проба 17.11 (Основатель подтвердил «погасли»):
+        // FindWindow("Progman") → SendMessageTimeout(WM_SYSCOMMAND, SC_MONITORPOWER=2,
+        // SMTO_ABORTIFHUNG, 5с) ×3 с паузой 700мс + дубль в WorkerW. Фикс = v2.
         try {
           const script =
-            "Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, IntPtr l, uint f, uint t, out IntPtr r);' -Name W -Namespace M; " +
-            "$r=[IntPtr]::Zero; 1..3 | ForEach-Object { [M.W]::SendMessageTimeout([IntPtr]0xffff, 0x0112, [IntPtr]0xf170, [IntPtr]2, 2, 2000, [ref]$r) | Out-Null; Start-Sleep -Milliseconds 500 }"
+            "Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern IntPtr FindWindow(string cls, string title); [DllImport(\"user32.dll\")] public static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, IntPtr l, uint f, uint t, out IntPtr r);' -Name W2 -Namespace M2; " +
+            "$r=[IntPtr]::Zero; $pm=[M2.W2]::FindWindow('Progman',$null); 1..3 | ForEach-Object { [M2.W2]::SendMessageTimeout($pm, 0x0112, [IntPtr]0xf170, [IntPtr]2, 2, 5000, [ref]$r) | Out-Null; Start-Sleep -Milliseconds 700 }; " +
+            "$ww=[M2.W2]::FindWindow('WorkerW',$null); if ($ww -ne [IntPtr]::Zero) { [M2.W2]::SendMessageTimeout($ww, 0x0112, [IntPtr]0xf170, [IntPtr]2, 2, 5000, [ref]$r) | Out-Null }"
           const child = spawn("powershell", ["-NoProfile", "-Command", script], {
             detached: true,
             stdio: "ignore",
@@ -1104,11 +1104,11 @@ export default Plugin.define({
           // T176: spawn-ошибки (ENOENT и пр.) приходят асинхронно — try/catch их
           // НЕ ловит, endpoint раньше отвечал ok:true при мёртвом спавне.
           child.on("error", (err) => {
-            console.log("[dev-console] T176: monitors-off powershell spawn error: " + String(err))
+            console.log("[dev-console] T192: monitors-off powershell spawn error: " + String(err))
           })
           child.unref()
           diag.screens_off = "off@" + new Date().toISOString()
-          console.log("[dev-console] T176: экраны погашены кнопкой панели (SendMessageTimeout SC_MONITORPOWER=2 ×3)")
+          console.log("[dev-console] T192: экраны погашены кнопкой панели (Progman-targeted SC_MONITORPOWER=2 ×3 + WorkerW)")
           reply(res, 200, { ok: true, screens: diag.screens_off })
         } catch (e) {
           reply(res, 500, { ok: false, error: String(e) })
