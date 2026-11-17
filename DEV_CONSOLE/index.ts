@@ -1107,20 +1107,22 @@ export default Plugin.define({
             reply(res, 500, { ok: false, error: `monitors_off.ps1 не найден: ${monitorsScript}` })
             return
           }
-          const child = spawn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", monitorsScript], {
-            detached: true,
-            stdio: "ignore",
-            windowsHide: true,
-          })
-          // T176: spawn-ошибки (ENOENT и пр.) приходят асинхронно — try/catch их
-          // НЕ ловит, endpoint раньше отвечал ok:true при мёртвом спавне.
-          child.on("error", (err) => {
-            console.log("[dev-console] T192: monitors-off powershell spawn error: " + String(err))
-          })
-          child.unref()
+          // T194 (17.11): прямой spawn("powershell", [...args], {detached}) в рантайме
+          // сервиса МОЛЧА не рождает процесс (замер: до POST 4 powershell, после 4;
+          // консоль логов плагина туда не пишется). Рабочий паттерн в этом же
+          // рантайме — spawnDetached (server_guard, T94): shell:true резолвит
+          // исполняемый сам, панель-сервер им поднят и жив. Моники идут через него.
+          const spawned = spawnDetached(
+            `powershell -NoProfile -ExecutionPolicy Bypass -File "${monitorsScript}"`,
+            dirname(monitorsScript),
+          )
+          if (!spawned) {
+            reply(res, 500, { ok: false, error: "spawnDetached вернул null — спавн не состоялся" })
+            return
+          }
           diag.screens_off = "off@" + new Date().toISOString()
-          console.log("[dev-console] T192: экраны погашены кнопкой панели (Progman-targeted SC_MONITORPOWER=2 ×3 + WorkerW)")
-          reply(res, 200, { ok: true, screens: diag.screens_off })
+          console.log(`[dev-console] T192: экраны погашены кнопкой панели (pid ${spawned.pid}, Progman ×3 + WorkerW)`)
+          reply(res, 200, { ok: true, screens: diag.screens_off, pid: spawned.pid })
         } catch (e) {
           reply(res, 500, { ok: false, error: String(e) })
         }
